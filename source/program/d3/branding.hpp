@@ -11,7 +11,7 @@
 // setting.hpp includes this file, so every existing user of these macros is unaffected.
 // D3HACK_FULLVER stays in setting.hpp because it needs D3CLIENT_VER from build_info.hpp.
 
-#define D3HACK_VER    "D3Hack v3.8"
+#define D3HACK_VER    "D3Hack v3.17"
 #define D3HACK_AUTHOR "Jester"
 #define D3HACK_MODDER "Slothic"
 #define CRLF          "\n"

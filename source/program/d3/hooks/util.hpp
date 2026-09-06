@@ -6,6 +6,7 @@
 #include "program/d3/patches.hpp"
 #include "program/d3/types/common.hpp"
 #include "program/d3/types/attributes.hpp"
+#include "program/d3/util_globals.hpp"  // d3hack-custom: g_ptGCData, for the XP ledger
 #include "program/fs_util.hpp"
 #include "nn/fs.hpp"
 #include "lib/hook/inline.hpp"
@@ -62,6 +63,11 @@ namespace d3 {
     // d3hack-custom: primals granted so far in this world. Reset from sInitializeWorld,
     // which fires per Greater Rift, so the budget is per-rift rather than per-session.
     inline int g_nPrimalsThisWorld = 0;
+
+    // d3hack-custom: ethereals promoted to primal in this world. Ethereals are NOT part
+    // of the guaranteed-primal budget -- they are promoted unconditionally -- so they get
+    // their own tally rather than inflating g_nPrimalsThisWorld.
+    inline int g_nEtherealPrimalsThisWorld = 0;
 
     // d3hack-custom: per-world loot-roll tally. Lets a build prove it is handing normal
     // rifts back to the stock ancient/primal roll without having to farm until something
@@ -255,6 +261,22 @@ namespace d3 {
         // still owed for the current level, so its MAXIMUM is a full level cost, sampled
         // just after a level-up. The grant bound is built from that -- see the note there.
         inline u64  s_uMaxNeed[2] {};
+        // d3hack-custom: XP LEDGER state. One line per grant with everything needed to
+        // reconstruct where a number came from -- what the game offered, what we multiplied it
+        // by, what the carry did, what was actually handed over, and the tier and difficulty it
+        // happened in. Added 2026-09-05, after an XP ratchet went unnoticed until it had already
+        // moved a character roughly 15,000 paragon levels. Counters alone could not have caught
+        // it: the shape of the bug was in the ORDER of the grants, not in any total.
+        inline u64  s_uXpLastWant  = 0ull;   // post-multiplier, post-carry, saturated to 64 bits
+        inline int  s_nXpLastBonus = 1;      // GR bonus factor actually applied on this grant
+        inline bool s_bXpRested    = false;  // w3 == 0 on the call being delivered
+        inline u32  s_nXpSeq       = 0u;     // grant sequence number, so the log can be ordered
+        // d3hack-custom: PARAGON COST SCALING state. s_uCostRem is the fractional remainder of
+        // the division, NOT a carry -- it is bounded by the divisor, never persisted, and exists
+        // only so that small grants do not floor to zero and vanish. An 80-minute session
+        // contained 190 grants of 1-2 XP; without this they would all round away.
+        inline u64  s_uCostRem     = 0ull;
+        inline u64  s_uCostPct     = 100ull;  // effective cost multiplier this grant, in percent
         // d3hack-custom: XP CENSUS. "Kill 300 mobs and the bar barely moves, kill 25 more
         // and it moves the same amount" is either the multiplier failing to apply or the
         // grant being metered, and those want opposite fixes. Counting every call and every
@@ -761,8 +783,9 @@ namespace d3 {
         // Decide how much of the grant to hand over. Never returns
         // less than the game was going to grant on its own, on any path, so no failure in here
         // can leave a hero levelling slower than vanilla.
-        inline u64 Deliver(ActorCommonData *pACD, u64 uRaw) {
+        inline u64 DeliverInner(ActorCommonData *pACD, u64 uRaw) {
             Load();
+            s_uCostPct = 100ull;  // d3hack-custom: overwritten below if cost scaling applies
 
             // Everything here is in the units of the routine's x1 argument, i.e. BEFORE the
             // ExperienceMultiplier shift at 0x79FE70. uMaxX1 is the largest value that shift
@@ -778,11 +801,14 @@ namespace d3 {
             if (uNum > 100ull)
                 uWant = (uWant * uNum) / 100u;
             const int nBonus = global_config.rare_cheats.xp_gr_bonus;
+            s_nXpLastBonus   = 1;  // d3hack-custom: what the ledger reports, set where it applies
             // BonusGRLevel() marks the latch used itself, and only when the latch is what
             // answered -- see the comment on it. Setting that flag here instead is what used
             // to expire the latch before the rift-completion award could use it.
-            if (nBonus > 1 && BonusGRLevel() >= global_config.rare_cheats.xp_gr_bonus_min_gr)
+            if (nBonus > 1 && BonusGRLevel() >= global_config.rare_cheats.xp_gr_bonus_min_gr) {
                 uWant *= static_cast<unsigned>(nBonus);
+                s_nXpLastBonus = nBonus;
+            }
             // Worst case above: 2^64 * (1000 * 2^31) / 100 * 4096 < 2^118. No 128-bit wrap.
 
             // ---- how much of it the game can absorb without a level-up storm -------------
@@ -804,6 +830,53 @@ namespace d3 {
                 const s32  nLevel = GetAttrInt(pACD, bPara ? kKeyAltLevel : kKeyLevel);
                 const s32  nCap   = bPara ? ParagonCap() : GetAttrInt(pACD, kKeyLevelCap);
                 bAtCap            = (nCap > 0 && nLevel >= nCap);
+
+                // d3hack-custom: PARAGON XP COST SCALING above the flat-table region.
+                //
+                // The paragon XP table has 20000 rows and the index is clamped to 19999, so
+                // every level past 20000 costs exactly the same forever. That also freezes the
+                // 25-level grant cap, which is what otherwise lets a too-large multiplier
+                // self-correct as levels get dearer. Above 20000 nothing catches it.
+                //
+                // Raising the cost the game reads is the clean fix and it is a DEAD END -- the
+                // cost lives in the ALT_EXPERIENCE_NEXT HI/LO attribute pair, whose declared
+                // bit width runs out roughly 10x above where you already are, and exceeding it
+                // is the serializer abort. See the dead-end section in HANDOFF.
+                //
+                // So scale the INCOME instead: hand the game less than was earned. The cost
+                // stays exactly what the table says, no attribute ever holds a bigger number,
+                // and the bit width never enters into it. The XP bar still moves, just slower,
+                // which is the whole point -- progression stays visible and stays finite.
+                //
+                // !! This deliberately breaks the invariant the rest of this function holds:
+                // "never returns less than the game was going to grant on its own". With this
+                // on, a bug in here CAN stall progression rather than merely fail to help.
+                // That is why the code default is 0 (off) and why it is not gated on anything
+                // that could turn it on by accident.
+                //
+                // cost multiplier k = 1 + (levels above start / 1000) * (per1000 / 100),
+                // kept as the exact rational uNum/uDen so there is no floating point and no
+                // drift. Set ParagonXpCostFrom low to exercise it without a 20000-paragon hero.
+                {
+                    const int nFrom = global_config.rare_cheats.paragon_xp_cost_from;
+                    const int nPer  = global_config.rare_cheats.paragon_xp_cost_per1000;
+                    if (bPara && nPer > 0 && nFrom >= 0 && nLevel > nFrom) {
+                        const u64 uAbove = static_cast<u64>(nLevel - nFrom);
+                        const u64 uDen   = 100000ull;
+                        const u64 uNum   = uDen + uAbove * static_cast<u64>(nPer);
+                        s_uCostPct       = (uNum * 100ull) / uDen;
+                        // uWant is bounded by 2^118 by the note above; multiplying by uDen
+                        // (2^17) would leave 2^135 and wrap the 128-bit type. Past 2^100 the
+                        // precision of the remainder is meaningless anyway, so divide first.
+                        if (uWant > (static_cast<unsigned __int128>(1) << 100)) {
+                            uWant = (uWant / uNum) * uDen;
+                        } else {
+                            const unsigned __int128 t = uWant * uDen + s_uCostRem;
+                            uWant      = t / uNum;
+                            s_uCostRem = static_cast<u64>(t % uNum);
+                        }
+                    }
+                }
                 if (s_nTrace < 12) {
                     PRINT("[d3hack-trace] xp: acd=%p raw=%llu para=%d level=%d cap=%d",
                           static_cast<void *>(pACD), static_cast<unsigned long long>(uRaw),
@@ -900,6 +973,9 @@ namespace d3 {
             // rather than dropped: it is per account, and another hero may still be climbing.
             if (!bAtCap)
                 uWant += static_cast<unsigned __int128>(s_uCarry);
+            s_uXpLastWant = (uWant > static_cast<unsigned __int128>(0xFFFFFFFFFFFFFFFFull))
+                                ? 0xFFFFFFFFFFFFFFFFull
+                                : static_cast<u64>(uWant);
 
             s_uXpOut += (uWant <= static_cast<unsigned __int128>(uBound))
                             ? static_cast<u64>(uWant) : uBound;
@@ -932,6 +1008,54 @@ namespace d3 {
             s_bDirty = true;
             SaveIfStale();
             return uBound;
+        }
+
+        // d3hack-custom: THE LEDGER. Every grant, in order, with its context.
+        //
+        // Deliberately not rate limited and deliberately not gated on a count. The two XP bugs
+        // this project has hit were both invisible in totals and obvious in sequence: the
+        // rested recursion arriving with raw == the previous line's `need`, and a carry that
+        // grew across sessions. Both needed consecutive grants side by side to see. The
+        // existing traces stop after 8 and 12 lines, which is why neither was caught for two
+        // sessions. If the volume is a problem, turn the flag off -- do not cap it.
+        //
+        // Never calls BonusGRLevel(): that marks the completion latch used and would change
+        // the behaviour it is supposed to be observing. TrueGRLevel() and the latch value are
+        // read directly.
+        inline void LedgerLine(u64 uRaw, u64 uCarryIn, u64 uOut) {
+            int nDiff = -1, nTorment = -1, nPlayers = -1;
+            if (g_ptGCData != nullptr) {
+                nDiff    = static_cast<int>(g_ptGCData->eDifficultyLevel);
+                nTorment = static_cast<int>(g_ptGCData->nHandicapLevel);
+                nPlayers = static_cast<int>(g_ptGCData->nNumPlayers);
+            }
+            PRINT("[d3hack-xp] #%u raw=%llu rested=%d pools=%d mult=%llu%% grbonus=%dx "
+                  "cost=%llu%% carry_in=%llu want=%llu bound=%llu granted=%llu carry_out=%llu "
+                  "para_level=%d need=%llu GR=%d latch=%d diff=%d torment=%d players=%d",
+                  ++s_nXpSeq,
+                  static_cast<unsigned long long>(uRaw),
+                  s_bXpRested ? 1 : 0,
+                  Count(),
+                  static_cast<unsigned long long>(Numerator()),
+                  s_nXpLastBonus,
+                  static_cast<unsigned long long>(s_uCostPct),
+                  static_cast<unsigned long long>(uCarryIn),
+                  static_cast<unsigned long long>(s_uXpLastWant),
+                  static_cast<unsigned long long>(s_uXpLastBound),
+                  static_cast<unsigned long long>(uOut),
+                  static_cast<unsigned long long>(s_uCarry),
+                  s_nLastLevel,
+                  static_cast<unsigned long long>(s_uXpLastNeed),
+                  TrueGRLevel(), g_nLatchedGRLevel, nDiff, nTorment, nPlayers)
+        }
+
+        inline u64 Deliver(ActorCommonData *pACD, u64 uRaw) {
+            if (!global_config.rare_cheats.xp_ledger)
+                return DeliverInner(pACD, uRaw);
+            const u64 uCarryIn = s_uCarry;
+            const u64 uOut     = DeliverInner(pACD, uRaw);
+            LedgerLine(uRaw, uCarryIn, uOut);
+            return uOut;
         }
     }  // namespace pools
 
@@ -1105,7 +1229,8 @@ namespace d3 {
                                         ? reinterpret_cast<ActorCommonData *>(uACD)
                                         : nullptr;
 
-            ctx->X[1] = pools::Deliver(pHero, uRaw);
+            pools::s_bXpRested = bRested;  // d3hack-custom: for the ledger line
+            ctx->X[1]          = pools::Deliver(pHero, uRaw);
         }
     };
 
@@ -2035,8 +2160,10 @@ namespace d3 {
             static bool s_bWarned = false;
             if (!s_bWarned) {
                 s_bWarned = true;
-                PRINT("[d3hack-plan] float cache FULL at %d maps -- further maps are dropped. "
-                      "Raise s_arMapFloats.", s_nMapFloats)
+                if (global_config.rare_cheats.verbose_world_log) {
+                    PRINT("[d3hack-plan] float cache FULL at %d maps -- further maps are dropped. "
+                          "Raise s_arMapFloats.", s_nMapFloats)
+                }
             }
             return;
         }
@@ -2148,7 +2275,9 @@ namespace d3 {
         }
         nn::fs::CloseFile(fh);
         if (s_nMapFloats > 0)
-            PRINT("[d3hack-plan] loaded floats for %d map(s) from disk", s_nMapFloats)
+            if (global_config.rare_cheats.verbose_world_log) {
+                PRINT("[d3hack-plan] loaded floats for %d map(s) from disk", s_nMapFloats)
+            }
     }
 
     // Called from sInitializeWorld -- the main thread, and a loading point where a brief
@@ -2179,8 +2308,10 @@ namespace d3 {
             static int s_nFailed = 0;
             if (s_nFailed < 3) {
                 ++s_nFailed;
-                PRINT("[d3hack-plan] could not write %s (%s) -- floats stay in memory for this "
-                      "session", kMapFloatPath, err.c_str())
+                if (global_config.rare_cheats.verbose_world_log) {
+                    PRINT("[d3hack-plan] could not write %s (%s) -- floats stay in memory for this "
+                          "session", kMapFloatPath, err.c_str())
+                }
             }
         }
     }
@@ -2584,12 +2715,16 @@ namespace d3 {
         static int s_nLogged = 0;
         if (s_nLogged < 16) {
             ++s_nLogged;
-            PRINT("[d3hack-map] floor %d tileset: %d \"%s\"%s", nIdx, snoOld,
-                  szOld != nullptr ? szOld : "?",
-                  RiftMapIsBanned(snoOld) ? "   <-- BANNED" : "")
+            if (global_config.rare_cheats.verbose_world_log) {
+                PRINT("[d3hack-map] floor %d tileset: %d \"%s\"%s", nIdx, snoOld,
+                      szOld != nullptr ? szOld : "?",
+                      RiftMapIsBanned(snoOld) ? "   <-- BANNED" : "")
+            }
             if (snoNew != snoOld)
-                PRINT("[d3hack-map]   replaced with %d \"%s\"", snoNew,
-                      szNew != nullptr ? szNew : "?")
+                if (global_config.rare_cheats.verbose_world_log) {
+                    PRINT("[d3hack-map]   replaced with %d \"%s\"", snoNew,
+                          szNew != nullptr ? szNew : "?")
+                }
         }
 
         // d3hack-custom: name the map on screen, so the ban list can be written from play
@@ -2785,8 +2920,10 @@ namespace d3 {
             return;
 
         const bool bBanned = RiftMapIsBanned(snoTileset);
-        PRINT("[d3hack-map] floor %d map: %d \"%s\"%s", s_nPickFloor, snoTileset, szRaw,
-              bBanned ? "  (on the ban list)" : "")
+        if (global_config.rare_cheats.verbose_world_log) {
+            PRINT("[d3hack-map] floor %d map: %d \"%s\"%s", s_nPickFloor, snoTileset, szRaw,
+                  bBanned ? "  (on the ban list)" : "")
+        }
 
         // Slot it by floor. A pick for a HIGHER floor than the one we are showing is the
         // pre-build, so it becomes "next"; anything else replaces "current". Going backwards
@@ -3193,8 +3330,10 @@ namespace d3 {
                 static int s_nLog = 0;
                 if (s_nLog < 24) {
                     ++s_nLog;
-                    PRINT("[d3hack-area] resolve id=0x%08X -> %d \"%s\" RECORDED (table %d)",
-                          static_cast<u32>(nId), snoMap, RiftMapName(snoMap), s_nAreaId)
+                    if (global_config.rare_cheats.verbose_world_log) {
+                        PRINT("[d3hack-area] resolve id=0x%08X -> %d \"%s\" RECORDED (table %d)",
+                              static_cast<u32>(nId), snoMap, RiftMapName(snoMap), s_nAreaId)
+                    }
                 }
             }
             return snoMap;
@@ -3392,9 +3531,11 @@ namespace d3 {
             static int s_nLog = 0;
             if (s_nLog < 60) {
                 ++s_nLog;
-                PRINT("[d3hack-plan] floor[%d] map=%d \"%s\" levelarea=%d label=\"%s\"%s",
-                      nIdx, snoMap, (szMap != nullptr) ? szMap : "(unknown tileset)", snoArea,
-                      szLabel, (szMap != nullptr && RiftMapIsBanned(snoMap)) ? "  BANNED" : "")
+                if (global_config.rare_cheats.verbose_world_log) {
+                    PRINT("[d3hack-plan] floor[%d] map=%d \"%s\" levelarea=%d label=\"%s\"%s",
+                          nIdx, snoMap, (szMap != nullptr) ? szMap : "(unknown tileset)", snoArea,
+                          szLabel, (szMap != nullptr && RiftMapIsBanned(snoMap)) ? "  BANNED" : "")
+                }
             }
         }
     };
@@ -3470,7 +3611,9 @@ namespace d3 {
             {
                 static int s_nSeen = 0;
                 if (++s_nSeen == 1)
-                    PRINT_LINE("[d3hack-plan] plan query hook is LIVE (0x816E98)");
+                    if (global_config.rare_cheats.verbose_world_log) {
+                        PRINT_LINE("[d3hack-plan] plan query hook is LIVE (0x816E98)");
+                    }
             }
 
             if (!global_config.rare_cheats.world_gen_probe)
@@ -3478,9 +3621,11 @@ namespace d3 {
             static int s_nLog = 0;
             if (s_nLog < 40) {
                 ++s_nLog;
-                PRINT("[d3hack-plan] query floor %d: plan-loaded flag = %d%s",
-                      static_cast<int>(ctx->W[19]), static_cast<int>(ctx->W[9]),
-                      (ctx->W[9] == 0) ? "  (about to build it from Lua)" : "")
+                if (global_config.rare_cheats.verbose_world_log) {
+                    PRINT("[d3hack-plan] query floor %d: plan-loaded flag = %d%s",
+                          static_cast<int>(ctx->W[19]), static_cast<int>(ctx->W[9]),
+                          (ctx->W[9] == 0) ? "  (about to build it from Lua)" : "")
+                }
             }
         }
     };
@@ -3541,19 +3686,25 @@ namespace d3 {
         }
 
         if (nEligible == 0) {
-            PRINT_LINE("[d3hack-plan] SUBSTITUTION CANNOT WORK: every map is banned. Remove at "
-                       "least one name from BannedRiftMaps.");
+            if (global_config.rare_cheats.verbose_world_log) {
+                PRINT_LINE("[d3hack-plan] SUBSTITUTION CANNOT WORK: every map is banned. Remove at "
+                           "least one name from BannedRiftMaps.");
+            }
             return;
         }
         if (nKnown == 0) {
-            PRINT("[d3hack-plan] SUBSTITUTION NOT READY: %d map(s) eligible, 0 with known "
-                  "floats. Nothing can be substituted in until the game rolls one of them into "
-                  "a Greater Rift plan. If your list is Nephalem-only tilesets it will never "
-                  "happen -- see rift-maps.txt.", nEligible)
+            if (global_config.rare_cheats.verbose_world_log) {
+                PRINT("[d3hack-plan] SUBSTITUTION NOT READY: %d map(s) eligible, 0 with known "
+                      "floats. Nothing can be substituted in until the game rolls one of them into "
+                      "a Greater Rift plan. If your list is Nephalem-only tilesets it will never "
+                      "happen -- see rift-maps.txt.", nEligible)
+            }
             return;
         }
-        PRINT("[d3hack-plan] substitution ready: %d eligible, %d usable now (%d of them "
-              "preferred), %d map(s) cached", nEligible, nKnown, nPrefOk, s_nMapFloats)
+        if (global_config.rare_cheats.verbose_world_log) {
+            PRINT("[d3hack-plan] substitution ready: %d eligible, %d usable now (%d of them "
+                  "preferred), %d map(s) cached", nEligible, nKnown, nPrefOk, s_nMapFloats)
+        }
     }
 
     // d3hack-custom: say WHY a substitution refused, in terms the config owner can act on.
@@ -3581,15 +3732,19 @@ namespace d3 {
         }
 
         if (nEligible == 0) {
-            PRINT("[d3hack-plan] %d floor(s) NOT swapped: EVERY map is banned. BannedRiftMaps "
-                  "covers all %d names, so there is nothing to substitute in. Unban at least "
-                  "one map.", nRefused, static_cast<int>(sizeof(kRiftMaps) / sizeof(kRiftMaps[0])))
+            if (global_config.rare_cheats.verbose_world_log) {
+                PRINT("[d3hack-plan] %d floor(s) NOT swapped: EVERY map is banned. BannedRiftMaps "
+                      "covers all %d names, so there is nothing to substitute in. Unban at least "
+                      "one map.", nRefused, static_cast<int>(sizeof(kRiftMaps) / sizeof(kRiftMaps[0])))
+            }
             return;
         }
 
-        PRINT("[d3hack-plan] %d floor(s) NOT swapped. %d map(s) are eligible, %d of them have "
-              "known floats. A map can only be substituted IN once the game has rolled it into "
-              "a Greater Rift plan at least once.", nRefused, nEligible, nKnown)
+        if (global_config.rare_cheats.verbose_world_log) {
+            PRINT("[d3hack-plan] %d floor(s) NOT swapped. %d map(s) are eligible, %d of them have "
+                  "known floats. A map can only be substituted IN once the game has rolled it into "
+                  "a Greater Rift plan at least once.", nRefused, nEligible, nKnown)
+        }
 
         // Name them. Capped, because an empty AllowedRiftMaps with a short ban list leaves
         // well over a hundred and a log full of names helps nobody.
@@ -3600,11 +3755,15 @@ namespace d3 {
             if (MapFloatsFor(tRow.sno) != nullptr)
                 continue;
             if (nShown >= 20) {
-                PRINT("[d3hack-plan]   ... and %d more", nEligible - nKnown - nShown)
+                if (global_config.rare_cheats.verbose_world_log) {
+                    PRINT("[d3hack-plan]   ... and %d more", nEligible - nKnown - nShown)
+                }
                 break;
             }
             ++nShown;
-            PRINT("[d3hack-plan]   waiting on floats: %s", tRow.szName)
+            if (global_config.rare_cheats.verbose_world_log) {
+                PRINT("[d3hack-plan]   waiting on floats: %s", tRow.szName)
+            }
         }
     }
 
@@ -4064,8 +4223,10 @@ namespace d3 {
                     for (int i = 0; i < 3; ++i)
                         *reinterpret_cast<float *>(uRow + 0x170 + i * 4) = pfNew[i];
                     ++nSwapped;
-                    PRINT("[d3hack-plan] floor %2d SWAP %d \"%s\" -> %d \"%s\" (floats carried)",
-                          n, snoOld, RiftMapName(snoOld), snoNew, RiftMapName(snoNew))
+                    if (global_config.rare_cheats.verbose_world_log) {
+                        PRINT("[d3hack-plan] floor %2d SWAP %d \"%s\" -> %d \"%s\" (floats carried)",
+                              n, snoOld, RiftMapName(snoOld), snoNew, RiftMapName(snoNew))
+                    }
                 }
                 // A refusal used to print one vague line and nothing else, which is how a
                 // user ends up reporting "the ban list does nothing" with no way to see why.
@@ -4079,7 +4240,9 @@ namespace d3 {
             int nUsed   = 0;
             int nBanned = 0;
 
-            PRINT_LINE("[d3hack-plan] --- rift floor plan, 10 slots ---");
+            if (global_config.rare_cheats.verbose_world_log) {
+                PRINT_LINE("[d3hack-plan] --- rift floor plan, 10 slots ---");
+            }
             for (int n = 1; n <= 10; ++n) {
                 const uintptr_t uRow    = uBase + static_cast<uintptr_t>(n) * 0x60ull;
                 const s32       snoMap  = *reinterpret_cast<const s32 *>(uRow + 0x16C);
@@ -4108,15 +4271,19 @@ namespace d3 {
                     if (bReject)
                         ++nBanned;
                 }
-                PRINT("[d3hack-plan] floor %2d: map=%d \"%s\" levelarea=%d f=%d/%d/%d "
-                      "label=\"%s\"%s",
-                      n, snoMap, (szMap != nullptr) ? szMap : "-", snoArea, arMilli[0],
-                      arMilli[1], arMilli[2], szLabel, bReject ? "  REJECTED" : "")
+                if (global_config.rare_cheats.verbose_world_log) {
+                    PRINT("[d3hack-plan] floor %2d: map=%d \"%s\" levelarea=%d f=%d/%d/%d "
+                          "label=\"%s\"%s",
+                          n, snoMap, (szMap != nullptr) ? szMap : "-", snoArea, arMilli[0],
+                          arMilli[1], arMilli[2], szLabel, bReject ? "  REJECTED" : "")
+                }
             }
 
-            PRINT("[d3hack-plan] --- %d floors, %d still unwanted, %d swapped, %d refused "
-                  "(known floats: %d maps) ---",
-                  nUsed, nBanned, nSwapped, nRefused, s_nMapFloats)
+            if (global_config.rare_cheats.verbose_world_log) {
+                PRINT("[d3hack-plan] --- %d floors, %d still unwanted, %d swapped, %d refused "
+                      "(known floats: %d maps) ---",
+                      nUsed, nBanned, nSwapped, nRefused, s_nMapFloats)
+            }
         }
     };
 
@@ -5546,9 +5713,11 @@ namespace d3 {
             if (s_nSeen < 24) {
                 ++s_nSeen;
                 const char *szPlan = (snoM != 0) ? RiftMapName(snoM) : nullptr;
-                PRINT("[d3hack-area] plan floor: id=0x%08X -> %s (table %d)",
-                      static_cast<u32>(nId), (szPlan != nullptr) ? szPlan : "UNKNOWN id",
-                      s_nAreaId)
+                if (global_config.rare_cheats.verbose_world_log) {
+                    PRINT("[d3hack-area] plan floor: id=0x%08X -> %s (table %d)",
+                          static_cast<u32>(nId), (szPlan != nullptr) ? szPlan : "UNKNOWN id",
+                          s_nAreaId)
+                }
             }
             // d3hack-custom: THE WRITE IS DISARMED. Read-only from here down.
             //
@@ -7197,6 +7366,16 @@ namespace d3 {
               global_config.loot_modifiers.AncientMinGRLevel,
               global_config.loot_modifiers.PrimalMinGRLevel,
               global_config.loot_modifiers.PrimalGuaranteedCount)
+        // d3hack-custom: difficulty, every world. The ledger carries it per grant, but a world
+        // with no kills in it still needs to be on the record -- "monsters feel too strong" is
+        // a difficulty question first and an experience question second, and the two were not
+        // separable on 2026-09-06 because nothing logged the difficulty at all.
+        if (g_ptGCData != nullptr) {
+            PRINT("[d3hack-custom] difficulty = %d, handicap/torment = %d, players = %d",
+                  static_cast<int>(g_ptGCData->eDifficultyLevel),
+                  static_cast<int>(g_ptGCData->nHandicapLevel),
+                  static_cast<int>(g_ptGCData->nNumPlayers))
+        }
     }
 
     // d3hack-custom: will this specifier actually produce a legendary?
@@ -7217,6 +7396,33 @@ namespace d3 {
             return false;
         const auto gbidItem = *reinterpret_cast<const GBID *>(reinterpret_cast<const uint8 *>(tSpecifier) + 8);
         return LootItemIsLegendary(gbidItem) != 0;
+    }
+
+    // d3hack-custom: eAncientRank MUST land at +0xD8. Stock LootRollForAncientLegendary
+    // writes the rank through exactly one store, `str w8, [x19, #0xD8]` at 0x88DE5C, which
+    // all three of its outcomes branch to: ethereal (w8=1, 0x88DE58), ancient (w8=1,
+    // 0x88DF2C) and primal (w8=2, 0x88E004). The declared LootSpecifier layout is not
+    // trustworthy in general -- see SpecifierIsLegendary -- so pin the one offset that is.
+    static_assert(offsetof(LootSpecifier, eAncientRank) == 0xD8,
+                  "LootSpecifier::eAncientRank moved off +0xD8 -- re-derive against 0x88DE5C "
+                  "before trusting any ancient/primal override");
+
+    // d3hack-custom: is this specifier an Ethereal?
+    //
+    // Same raw +8 GBID read as SpecifierIsLegendary -- that is the offset stock
+    // LootRollForAncientLegendary itself indexes at 0x88DE4C, and the reason the
+    // declared LootSpecifier field names are not used here.
+    //
+    // LootItemIsEthereal (0x50E810) is that same function's next gate, at 0x88DE50.
+    // It is structurally identical to LootItemIsLegendary: fetch the item's GameBalance
+    // record through GBRecordGet, test one bit of the flags dword at +0x20 (bit 31 for
+    // ethereal, bit 0 for legendary, bit 26 for seasonal-only), release, return. A pure
+    // read with no side effects, so it is safe to call from inside the loot roll.
+    inline auto SpecifierIsEthereal(const LootSpecifier *tSpecifier) -> bool {
+        if (tSpecifier == nullptr || LootItemIsEthereal == nullptr)
+            return false;
+        const auto gbidItem = *reinterpret_cast<const GBID *>(reinterpret_cast<const uint8 *>(tSpecifier) + 8);
+        return LootItemIsEthereal(gbidItem) != 0;
     }
 
     // d3hack-custom: read an int attribute with param -1 off an ACD.
@@ -7306,6 +7512,37 @@ namespace d3 {
                 PRINT("[d3hack-custom] primal %d/%d granted at GR %d", g_nPrimalsThisWorld,
                       global_config.loot_modifiers.PrimalGuaranteedCount, nRealGR)
             }
+        }
+
+        // d3hack-custom: ETHEREALS ALWAYS PRIMAL.
+        //
+        // Stock LootRollForAncientLegendary hard-codes ethereals to Ancient and returns:
+        //
+        //     0088DE4C  ldr  w0, [x19, #8]      ; gbid
+        //     0088DE50  bl   0x50E810           ; LootItemIsEthereal
+        //     0088DE54  cbz  w0, 0x88DE64       ; not ethereal -> normal ancient/primal roll
+        //     0088DE58  mov  w8, #1             ; Ancient
+        //     0088DE5C  str  w8, [x19, #0xD8]   ; eAncientRank
+        //     0088DE60  b    0x88DE00           ; RETURN -- never reaches the primal branch
+        //
+        // The primal branch at 0x88E004 is `mov w8, #2` + `b 0x88DE5C`, i.e. it jumps into
+        // that same store, so +0xD8 is eAncientRank and 2 is Primal. An ethereal simply
+        // never gets there. That is why ethereals are always Ancient and never Primal.
+        //
+        // Raising the rank here rather than patching the `mov w8, #1` keeps this additive:
+        // the stock roll still runs first, this only ever raises, and it is off by default.
+        // Ungated by GR level and outside the PrimalGuaranteedCount budget, because the
+        // user asked for ALWAYS -- a promotion that spent the budget would be capped at
+        // three per rift and would also starve normal legendaries of their guaranteed
+        // primals. No SpecifierIsLegendary() gate either: the stock function already
+        // proved the item legendary at 0x88DE44 before it could reach the ethereal test,
+        // so an ethereal is legendary by construction.
+        if (global_config.loot_modifiers.EtherealAlwaysPrimal &&
+            tSpecifier->eAncientRank < 2 && SpecifierIsEthereal(tSpecifier)) {
+            tSpecifier->eAncientRank = 2;
+            ++g_nEtherealPrimalsThisWorld;
+            PRINT("[d3hack-custom] ethereal promoted to primal (#%d this world, stock rank %d)",
+                  g_nEtherealPrimalsThisWorld, nStockRank)
         }
 
         if (tSpecifier->eAncientRank != nStockRank)
@@ -10047,15 +10284,434 @@ namespace d3 {
 
         if (g_nAncientRollsThisWorld > 0) {
             PRINT("[d3hack-custom] loot rolls last world: %d total, %d stock-untouched, "
-                  "%d rank-raised, %d guaranteed primals",
+                  "%d rank-raised, %d guaranteed primals, %d ethereal primals",
                   g_nAncientRollsThisWorld, g_nAncientStockThisWorld,
-                  g_nAncientRaisedThisWorld, g_nPrimalsThisWorld)
+                  g_nAncientRaisedThisWorld, g_nPrimalsThisWorld, g_nEtherealPrimalsThisWorld)
         }
         g_nAncientRollsThisWorld  = 0;
         g_nAncientStockThisWorld  = 0;
         g_nAncientRaisedThisWorld = 0;
         g_nPrimalsThisWorld       = 0;
+        g_nEtherealPrimalsThisWorld = 0;
     }
+    // d3hack-custom: BACKPACK GRID PROBE -- why 10 x 20 crashed on inventory open.
+    //
+    // 0x488620 is the "visit every cell of a slot's grid" walker: it derives {w,h} for
+    // the slot (patch h00 @0x4886DC is its height) and then, for each cell, builds an
+    // InventoryLocation on the stack and calls a caller-supplied callback:
+    //
+    //     004887A4  stp  w8, w23, [sp, #0x28]   ; loc.x, loc.y
+    //     004887A8  blr  x22                    ; cb(&loc, user) -> BOOL keep-going
+    //
+    // With BackpackRows = 20 the inventory UI (main:0x1F19DC) walked 200 cells and died
+    // inside that callback with a nonsense pointer, so something serving per-cell data is
+    // sized for the stock 60. This probe does NOT guess which: it swaps in a tracing
+    // callback that logs each cell BEFORE handing off to the real one. The last cell
+    // logged without a matching "returned" line is the one that faults.
+    //
+    // Dies at cell 60 exactly -> a fixed 60-entry store, and the feature is dead.
+    // Dies anywhere else      -> a dimension site that was never patched, worth finishing.
+    //
+    // Trampoline, not replace, and it only diverts the BACKPACK slot: the other 80 callers
+    // of this walker (stash, merchant, sockets, hireling) run completely untouched.
+    using InvCellFn = BOOL (*)(const InventoryLocation *, void *);
+
+    inline InvCellFn s_pfnRealCell    = nullptr;
+    inline void     *s_pRealCellUser  = nullptr;
+    inline int       s_nCellsWalked   = 0;
+    inline int       s_nCellLogBudget = 0;
+    inline bool      s_bCellTracing   = false;
+
+    inline auto TraceInventoryCell(const InventoryLocation *tLoc, void *pUser) -> BOOL {
+        const int n = s_nCellsWalked++;
+        const int x = (tLoc != nullptr) ? tLoc->pt.x : -1;
+        const int y = (tLoc != nullptr) ? tLoc->pt.y : -1;
+        const bool bLog = s_nCellLogBudget > 0;
+        if (bLog) {
+            --s_nCellLogBudget;
+            // Printed BEFORE the handoff on purpose: if the callback faults, this line is
+            // the last thing in the log and it names the exact cell that did it.
+            PRINT("[d3hack-bpgrid] cell #%d  x=%d y=%d  -> callback", n, x, y)
+        }
+        if (s_pfnRealCell == nullptr)
+            return 0;
+        const BOOL r = s_pfnRealCell(tLoc, pUser);
+        if (bLog)
+            PRINT("[d3hack-bpgrid] cell #%d  x=%d y=%d  <- returned %d", n, x, y, static_cast<int>(r))
+        return r;
+    }
+    // d3hack-custom: read the backpack's flat cell array OBJECT, not the allocator.
+    //
+    // GetItemAtLocation (0x48A0B0) reaches the array like this, and every step is decoded:
+    //
+    //     0048A0D4..0048A110  FNV-1a over the 4 bytes of the slot id
+    //     0048A114  and  w9, w9, #0x1f          ; 32 buckets
+    //     0048A0F4  ldr  x8, [x21, #0xc8]       ; container -> inventory
+    //     0048A0F8  ldr  x8, [x8, #0x18]        ; -> bucket array
+    //     0048A118  ldr  x9, [x8, w9, uxtw #3]  ; bucket head
+    //     0048A120  ldr  w8, [x9, #8]           ; entry.slot ... chain on [x9]
+    //     0048A144  ldr  x8, [x9, #0x10]        ; entry -> the cell vector
+    //     0048A18C  ldr  x8, [x8]               ; vector -> int32 data
+    //
+    // So rather than hunt for whoever allocates it, walk the same chain and dump the
+    // vector object. A {data, size, capacity} shape puts the capacity in plain sight,
+    // which is the one number this whole feature is missing.
+    //
+    // Strictly read-only, one shot, and every pointer is range-checked first: heap
+    // pointers here are 0x10_xxxx_xxxx, so anything outside that is a bad walk and we
+    // stop rather than fault.
+    inline auto BpRead64(uintptr_t p) -> uintptr_t {
+        uintptr_t v = 0;
+        __builtin_memcpy(&v, reinterpret_cast<const void *>(p), sizeof(v));
+        return v;
+    }
+
+    inline auto BpPtrLooksLikeHeap(uintptr_t p) -> bool {
+        return p >= 0x1000000ull && p < 0x8000000000ull && (p & 3ull) == 0ull;
+    }
+
+    inline constexpr int kBpMaxCells  = 500;
+    inline constexpr int kBpMaxVectors = 4;   // player, plus room for hireling/co-op containers
+    inline int32         s_arBpCells[kBpMaxVectors][kBpMaxCells] = {};
+    inline uintptr_t     s_arBpGrownVec[kBpMaxVectors]           = {};
+    inline int           s_nBpGrown                              = 0;
+    inline void GrowBackpackCellVector(uintptr_t uVec, int nWantCells) {
+        if (uVec == 0 || nWantCells <= 0 || nWantCells > kBpMaxCells)
+            return;
+
+        // Per-vector, not one-shot. The previous version grew the FIRST backpack vector it
+        // saw and then latched, but there is more than one backpack container alive and the
+        // walk that crashed was reading a different, still-60-entry vector: the fault
+        // computed acd_base(0) + 48*0x360, i.e. it pulled item id 48 out of memory past the
+        // end. Grow every distinct vector, and re-check on each visit so a container that
+        // gets rebuilt is caught again.
+        for (int i = 0; i < s_nBpGrown; ++i)
+            if (s_arBpGrownVec[i] == uVec)
+                return;
+
+        const uintptr_t uData = BpRead64(uVec);
+        const int32     nSize = *reinterpret_cast<const int32 *>(uVec + 0x08);
+        const int32     nCap  = *reinterpret_cast<const int32 *>(uVec + 0x10);
+        if (!BpPtrLooksLikeHeap(uData) || nCap <= 0 || nCap > kBpMaxCells) {
+            PRINT("[d3hack-bpgrid] grow: refusing vec=0x%016llX data=0x%016llX size=%d cap=%d",
+                  static_cast<unsigned long long>(uVec),
+                  static_cast<unsigned long long>(uData), nSize, nCap)
+            return;
+        }
+        if (nCap >= nWantCells) {
+            PRINT("[d3hack-bpgrid] grow: vec=0x%016llX already %d cells",
+                  static_cast<unsigned long long>(uVec), nCap)
+            return;
+        }
+        if (s_nBpGrown >= kBpMaxVectors) {
+            PRINT("[d3hack-bpgrid] grow: OUT OF BUFFERS (%d used) -- vec=0x%016llX left at %d",
+                  s_nBpGrown, static_cast<unsigned long long>(uVec), nCap)
+            return;
+        }
+
+        const int nSlot   = s_nBpGrown++;
+        auto     *arNew   = s_arBpCells[nSlot];
+        const auto *arOld = reinterpret_cast<const int32 *>(uData);
+        for (int i = 0; i < nWantCells; ++i)
+            arNew[i] = (i < nCap) ? arOld[i] : -1;
+
+        const auto uNew = reinterpret_cast<uintptr_t>(arNew);
+        __builtin_memcpy(reinterpret_cast<void *>(uVec), &uNew, sizeof(uNew));
+        *reinterpret_cast<int32 *>(uVec + 0x08) = nWantCells;
+        *reinterpret_cast<int32 *>(uVec + 0x10) = nWantCells;
+        s_arBpGrownVec[nSlot] = uVec;
+
+        PRINT("[d3hack-bpgrid] grow[%d]: vec=0x%016llX data 0x%016llX -> 0x%016llX, cap %d -> %d",
+              nSlot, static_cast<unsigned long long>(uVec),
+              static_cast<unsigned long long>(uData), static_cast<unsigned long long>(uNew),
+              nCap, nWantCells)
+    }
+
+    // d3hack-custom: resolve this container's backpack cell vector and make sure it is
+    // big enough for the patched grid. Silent, cheap, idempotent -- the pool lookup in
+    // GrowBackpackCellVector returns immediately for a vector already handled, so the
+    // per-walk cost after the first is a hash walk and a compare.
+    inline auto ResolveBackpackCellVector(ActorCommonData *ptContainer) -> uintptr_t {
+        if (ptContainer == nullptr)
+            return 0;
+        const auto uContainer = reinterpret_cast<uintptr_t>(ptContainer);
+        if (!BpPtrLooksLikeHeap(uContainer))
+            return 0;
+        const uintptr_t uInv = BpRead64(uContainer + 0xC8);
+        if (!BpPtrLooksLikeHeap(uInv))
+            return 0;
+        const uintptr_t uBuckets = BpRead64(uInv + 0x18);
+        if (!BpPtrLooksLikeHeap(uBuckets))
+            return 0;
+
+        const uint32 uSlot = static_cast<uint32>(SLOT_PLAYER_BACKPACK);
+        uint32       h     = (uSlot & 0xFFu) ^ 0x811C9DC5u;
+        h *= 0x01000193u;
+        h = (h ^ ((uSlot >> 8) & 0xFFu)) * 0x01000193u;
+        h = (h ^ (uSlot >> 16)) * 0x01000193u;
+        h = (h ^ (uSlot >> 24)) * 0x01000193u;
+        h &= 0x1Fu;
+
+        uintptr_t uEntry = BpRead64(uBuckets + 8ull * h);
+        for (int nHops = 0; BpPtrLooksLikeHeap(uEntry) && nHops < 64; ++nHops) {
+            if (*reinterpret_cast<uint32 *>(uEntry + 8) == uSlot)
+                return BpRead64(uEntry + 0x10);
+            uEntry = BpRead64(uEntry);
+        }
+        return 0;
+    }
+
+    inline void EnsureBackpackCapacity(ActorCommonData *ptContainer) {
+        const uintptr_t uVec = ResolveBackpackCellVector(ptContainer);
+        if (uVec != 0)
+            GrowBackpackCellVector(uVec, 10 * global_config.loot_modifiers.BackpackRows);
+    }
+
+    inline void DumpBackpackCellVector(ActorCommonData *ptContainer) {
+        // Log the raw value at EVERY step before deciding whether to follow it. The first
+        // version guarded silently and produced nothing at all across 7 full walks, which
+        // told us less than no output at all would have: a silent early return is
+        // indistinguishable from "the code never ran".
+        // The RESOLVE + GROW must run on every walk -- a backpack container can show up
+        // late, and the crash we are chasing was exactly a vector that was never grown.
+        // Only the printing is budgeted, or 1900 walks would bury the log.
+        static int s_nTries = 0;
+        ++s_nTries;
+        const bool bLog = (s_nTries <= 3);
+
+        const auto uContainer = reinterpret_cast<uintptr_t>(ptContainer);
+        if (bLog)
+            PRINT("[d3hack-bpgrid] cv#%d: container = 0x%016llX", s_nTries,
+              static_cast<unsigned long long>(uContainer))
+        if (!BpPtrLooksLikeHeap(uContainer))
+            return;
+
+        const uintptr_t uInv = BpRead64(uContainer + 0xC8);
+        if (bLog)
+            PRINT("[d3hack-bpgrid] cv#%d: [container+0xC8] inv = 0x%016llX", s_nTries,
+              static_cast<unsigned long long>(uInv))
+        if (!BpPtrLooksLikeHeap(uInv))
+            return;
+
+        const uintptr_t uBuckets = BpRead64(uInv + 0x18);
+        if (bLog)
+            PRINT("[d3hack-bpgrid] cv#%d: [inv+0x18] buckets = 0x%016llX", s_nTries,
+              static_cast<unsigned long long>(uBuckets))
+        if (!BpPtrLooksLikeHeap(uBuckets))
+            return;
+
+        const uint32 uSlot = static_cast<uint32>(SLOT_PLAYER_BACKPACK);
+        uint32       h     = (uSlot & 0xFFu) ^ 0x811C9DC5u;
+        h *= 0x01000193u;
+        h = (h ^ ((uSlot >> 8) & 0xFFu)) * 0x01000193u;
+        h = (h ^ (uSlot >> 16)) * 0x01000193u;
+        h = (h ^ (uSlot >> 24)) * 0x01000193u;
+        h &= 0x1Fu;
+
+        uintptr_t uEntry = BpRead64(uBuckets + 8ull * h);
+        if (bLog)
+            PRINT("[d3hack-bpgrid] cv#%d: bucket %u head = 0x%016llX", s_nTries, h,
+              static_cast<unsigned long long>(uEntry))
+
+        int nHops = 0;
+        while (BpPtrLooksLikeHeap(uEntry) && nHops < 64) {
+            const uint32 uEntrySlot = *reinterpret_cast<uint32 *>(uEntry + 8);
+            if (bLog)
+                PRINT("[d3hack-bpgrid] cv#%d:   hop %d entry=0x%016llX slot=%u", s_nTries, nHops,
+                  static_cast<unsigned long long>(uEntry), uEntrySlot)
+            if (uEntrySlot == uSlot)
+                break;
+            uEntry = BpRead64(uEntry);
+            ++nHops;
+        }
+        if (!BpPtrLooksLikeHeap(uEntry)) {
+            if (bLog)
+                PRINT("[d3hack-bpgrid] cv#%d: no entry for slot 0 after %d hops", s_nTries, nHops)
+            return;
+        }
+
+        const uintptr_t uVec = BpRead64(uEntry + 0x10);
+        if (bLog)
+            PRINT("[d3hack-bpgrid] cv: FOUND entry=0x%016llX vec=0x%016llX",
+              static_cast<unsigned long long>(uEntry), static_cast<unsigned long long>(uVec))
+        if (!BpPtrLooksLikeHeap(uVec))
+            return;
+
+        // Whatever the layout is, the capacity is in this header somewhere.
+        for (int i = 0; i < 6; ++i) {
+            const uintptr_t q = BpRead64(uVec + 8ull * i);
+            if (bLog)
+                PRINT("[d3hack-bpgrid] cv: vec+0x%02X = 0x%016llX  (int32 pair: %d, %d)",
+                  i * 8, static_cast<unsigned long long>(q),
+                  static_cast<int>(q & 0xFFFFFFFFu), static_cast<int>(q >> 32))
+        }
+
+        const uintptr_t uData = BpRead64(uVec);
+        if (!BpPtrLooksLikeHeap(uData))
+            return;
+        const auto *arCells = reinterpret_cast<const int32 *>(uData);
+        if (bLog)
+            PRINT("[d3hack-bpgrid] cv: data=0x%016llX cells[56..63] = %d %d %d %d %d %d %d %d",
+              static_cast<unsigned long long>(uData),
+              arCells[56], arCells[57], arCells[58], arCells[59],
+              arCells[60], arCells[61], arCells[62], arCells[63])
+        GrowBackpackCellVector(uVec, 10 * global_config.loot_modifiers.BackpackRows);
+    }
+
+    // d3hack-custom: grow the backpack's cell vector in place.  ** TEST ONLY -- see the
+    // free hazard at the bottom of this comment. Not shippable as written. **
+    //
+    // The dump settled what sizes it. The vector is {data, size, capacity} and reads
+    // capacity = 60 EXACTLY, while every width*height multiply in the inventory module
+    // lives in a function whose height this build already patched to 20 -- so those all
+    // compute 200 and none of them is what sized this. 60 is instead exactly the value of
+    // the Backpack_Slots attribute, which is why the two move together.
+    //
+    // Rather than keep hunting the allocation, point the vector at a buffer we own and
+    // widen size/capacity to match the patched grid. That answers the last open question
+    // outright: with the array genuinely large enough, does a 200-cell backpack work?
+    //
+    // ** HAZARD: the game allocated the original buffer and will free it when the
+    // container is destroyed (character switch, exit to menu). After this swap it will
+    // free OUR static instead, which is a different allocator and will corrupt or crash.
+    // Expect trouble on leaving the character, NOT during play. This exists to prove the
+    // concept; shipping needs the buffer to come from the game's own allocator, or the
+    // original pointer restored on teardown. **
+
+    // d3hack-custom: let the backpack use the cells the enlarged grid added.
+    //
+    // 0x488EC0 answers "may this cell be used?" as
+    //
+    //     capacity = MIN(width * height, <slot's capacity attribute>)
+    //     usable   = (y * width + x) < capacity
+    //
+    // where the attribute is Backpack_Slots for slot 0 and Shared_Stash_Slots for slot
+    // 0x0F. With the grid at 10x20 that is min(200, 60) = 60, so the new cells are all
+    // refused. Writing Backpack_Slots = 200 instead is a dead end: it exceeds the
+    // attribute's declared range and the ATTRIBUTE SERIALIZER asserts on it -- the crash
+    // is a fatal assert at 0xA2C340 reached through the attribute vtable dispatch at
+    // 0x67B0C0, which is the same field-width trap debug.hpp documents for paragon.
+    // Widening the descriptor would change every message carrying the attribute, and
+    // debug.hpp records that doing exactly that "overflowed the send buffer" and silently
+    // dropped the session. Not worth it for a capacity number.
+    //
+    // So override the answer instead of the input. Trampoline: run the stock check first
+    // and only ever turn a NO into a YES, never the reverse, and only for the backpack --
+    // the shared stash keeps its purchased-tab gating untouched, which matters because
+    // its tab count is real saved state.
+    HOOK_DEFINE_TRAMPOLINE(BackpackCellUsable) {
+        static auto Callback(const InventoryLocation *tLoc) -> BOOL {
+            const BOOL bStock = Orig(tLoc);
+            if (bStock != 0 || tLoc == nullptr)
+                return bStock;
+
+            const int nRows = global_config.loot_modifiers.BackpackRows;
+            if (nRows <= 6 || tLoc->eSlot != SLOT_PLAYER_BACKPACK)
+                return bStock;
+
+            // Width stays 10 -- the grid patch only moves height.
+            const int x = tLoc->pt.x;
+            const int y = tLoc->pt.y;
+            if (x < 0 || y < 0 || x >= 10 || y >= nRows)
+                return bStock;
+            return 1;
+        }
+    };
+
+
+    HOOK_DEFINE_TRAMPOLINE(BackpackGridWalk) {
+        static auto Callback(ActorCommonData *ptContainer, InventorySlotType eSlot, void *pUnk,
+                             InvCellFn pfnCell, void *pUser, BOOL bRevX, BOOL bRevY) -> BOOL {
+            const bool bFeature = global_config.loot_modifiers.active &&
+                                  global_config.loot_modifiers.BackpackRows > 6;
+            const bool bProbe   = global_config.rare_cheats.backpack_grid_probe;
+
+            // Reentrancy guard: the per-cell callback may walk another grid itself.
+            if (eSlot != SLOT_PLAYER_BACKPACK || s_bCellTracing || pfnCell == nullptr ||
+                (!bFeature && !bProbe))
+                return Orig(ptContainer, eSlot, pUnk, pfnCell, pUser, bRevX, bRevY);
+
+            // THE FEATURE. Silent, and it runs whether or not the probe is on -- growing the
+            // cell vector used to live inside the probe path, which meant the only way to
+            // have a working 200-slot backpack was to also eat ~3000 log lines per inventory
+            // open. That is the "feature gated behind a diagnostic flag" mistake this file
+            // has been burned by four times; see the table in HANDOFF.md.
+            if (bFeature)
+                EnsureBackpackCapacity(ptContainer);
+
+            // THE PROBE. Pure diagnostics: per-cell tracing, nothing the feature needs.
+            if (!bProbe)
+                return Orig(ptContainer, eSlot, pUnk, pfnCell, pUser, bRevX, bRevY);
+
+            s_bCellTracing   = true;
+            s_pfnRealCell    = pfnCell;
+            s_pRealCellUser  = pUser;
+            s_nCellsWalked   = 0;
+            s_nCellLogBudget = global_config.rare_cheats.backpack_grid_probe_cells;
+            DumpBackpackCellVector(ptContainer);
+            PRINT("[d3hack-bpgrid] ==== BACKPACK walk BEGIN (rows=%d, Backpack_Slots=%d) ====",
+                  global_config.loot_modifiers.BackpackRows, ReadAttrInt(ptContainer, BACKPACK_SLOTS))
+
+            const BOOL r = Orig(ptContainer, eSlot, pUnk, &TraceInventoryCell, pUser, bRevX, bRevY);
+
+            PRINT("[d3hack-bpgrid] ==== BACKPACK walk END: %d cells visited, walker returned %d ====",
+                  s_nCellsWalked, static_cast<int>(r))
+            s_bCellTracing = false;
+            s_pfnRealCell  = nullptr;
+            return r;
+        }
+    };
+    // d3hack-custom: the OTHER half of backpack capacity.
+    //
+    // The 14-site grid patch raises the addressable grid, but the game gates usable cells
+    // on an attribute as well. 0x488EC0:
+    //
+    //     00488EDC  mov  w9, #-0xff8     ; key 0xFFFFF008 = Backpack_Slots, param -1
+    //     00488EF0  csel x20, x9, x10, eq; slot 0 (BACKPACK) uses that key
+    //     00488FA4  mul  w8, w22, w23    ; width * height
+    //     00488FBC  csel w8, w8, w0, lt  ; capacity = MIN(width*height, Backpack_Slots)
+    //
+    // With the grid at 10x20 and the attribute still 60, capacity stayed min(200,60) = 60.
+    // Exactly TWO sites in the whole binary build that key (0x488BC0, 0x488EDC) and both
+    // are READS -- the game never writes it, so it comes from character/save data and we
+    // have to write it ourselves.
+    //
+    // NOTE this alone is not known to be sufficient. GetItemAtLocation (0x48A0B0) does a
+    // raw `array[y*width + x]` with no bounds check at all and does not consult the gate,
+    // so the flat cell array must ALSO be large enough. Whether that array is sized from
+    // this attribute is precisely what this run is testing: if it is, the inventory opens;
+    // if the walk still dies at cell 61 with Backpack_Slots reading 200, the array is
+    // allocated somewhere else and that has to be found first.
+    inline int g_nBackpackSlotsApplied = 0;
+
+    inline void ApplyBackpackSlots() {
+        const int nRows = global_config.loot_modifiers.BackpackRows;
+        if (!global_config.loot_modifiers.active || nRows <= 6)
+            return;  // 6 is stock -- never touch the attribute in that case
+        if (GetPrimaryPlayer == nullptr || ACDTryToGet == nullptr || ACD_AttributesSetInt == nullptr)
+            return;
+
+        ActorCommonData *ptACD = ACDTryToGet(GetPrimaryPlayer());
+        if (ptACD == nullptr)
+            return;
+
+        const int nWant = 10 * nRows;  // width is deliberately left at 10 by the grid patch
+        const int nHave = ReadAttrInt(ptACD, BACKPACK_SLOTS);
+        if (nHave == nWant)
+            return;
+
+        FastAttribKey tKey;
+        tKey.nValue = BACKPACK_SLOTS | (-1 << 12);  // param -1, matching what 0x488EDC reads
+        ACD_AttributesSetInt(ptACD, tKey, nWant);
+
+        // Read back through the game's own getter, not our own cached value.
+        const int nNow = ReadAttrInt(ptACD, BACKPACK_SLOTS);
+        ++g_nBackpackSlotsApplied;
+        PRINT("[d3hack-bpgrid] Backpack_Slots %d -> %d (game reads back %d) [apply #%d]",
+              nHave, nWant, nNow, g_nBackpackSlotsApplied)
+    }
+
+
 
     // d3hack-custom: TRAMPOLINE, not REPLACE. The stock roll has to stay reachable --
     // see the note in AugmentSpecifier.
@@ -10179,13 +10835,794 @@ namespace d3 {
     // affixes and cooldowns.
     inline auto IsBuffEndTick(u32 uAttr) -> bool { return uAttr >= 0x272u && uAttr <= 0x291u; }
 
+    // d3hack-custom: bind Boon of the Hoarder's power SNO BY NAME, so the gold feature below
+    // needs no hand-copied number and survives a renumbering.
+    //
+    // Two attribute writes name the gem between them:
+    //   JEWEL_RANK (0x57B) lands on the GEM's own item ACD, so GBIDToString gives its internal
+    //     name -- "Unique_Gem_0NN_x1" -- and the Items string list turns that into the display
+    //     name the player actually reads.
+    //   ITEM_POWER_PASSIVE (0x50D) lands on the PLAYER with the power SNO as the key's param,
+    //     and SNOToString names it "ItemPassive_Unique_Gem_0NN_x1".
+    //
+    // The NN token is shared between the two, so matching the power name's tail against the
+    // gem's internal name binds the SNO exactly. That beats correlating on the rank value:
+    // three gems can sit at the same rank, and the value carried by 0x50D is not yet proven
+    // to be the rank at all.
+    //
+    // Which NN Boon of the Hoarder is cannot be read out of the shipped data offline -- the
+    // romfs container's name pool does not line up with its records, and the gem description
+    // strings live in the ~15% of records using the second codec, whose preset dictionary is
+    // unknown -- so the match is made in the running game, where the strings resolve.
+    inline char s_szGoldGemItem[64]  = {};
+    inline s32  s_snoGoldGemPower    = 0;
+    inline bool s_bGoldGemReported   = false;
+    // Last JEWEL_RANK seen on the matched gem. The FALLBACK rank source: a set bonus is
+    // "ITEM_POWER_PASSIVE[power] = 1", so 0x50D is known to carry a flag in at least one
+    // case, and it is not yet proven to carry a gem's rank in this one. It is only ever
+    // consulted when 0x50D reads as that flag, so the "is it equipped" question is still
+    // answered by 0x50D and a spare copy of the gem in the stash cannot arm the bonus.
+    inline s32  s_nGoldGemRank       = 0;
+
+    // d3hack-custom: name every DISTINCT item that gets an attribute write.
+    //
+    // The cache-check probe at 0x89480C names a cache's CONTENTS, not the cache -- which is why
+    // "what is actually in the bag" was still unanswered after the ring dropped. This answers it
+    // from the other side: anything sitting in inventory gets attribute writes on sync, so
+    // watching the attribute setters and reporting each new item gbid once will name the cache.
+    //
+    // Cost control matters here: the setters are hot. The gbid is read straight out of the ACD
+    // (+0x38 == 2 marks an item, +0x3C is the gbid -- the same test the free-sockets hook uses),
+    // and GBIDToString, which allocates, is only called for a gbid never seen before.
+    inline void ItemCensus(ActorCommonData *pACD) {
+        if (!global_config.rare_cheats.goblin_cache_probe || pACD == nullptr)
+            return;
+        const auto p = reinterpret_cast<uintptr_t>(pACD);
+        if (p < 0x1000000000ull || p >= 0x8000000000ull)
+            return;
+        if (*reinterpret_cast<const s32 *>(p + 0x38) != 2)
+            return;  // not an item ACD
+        const u32 gbid = *reinterpret_cast<const u32 *>(p + 0x3C);
+        if (gbid == 0u || gbid == 0xFFFFFFFFu)
+            return;
+
+        static u32 s_arSeen[512] {};
+        static u32 s_nSeen = 0;
+        for (u32 i = 0; i < s_nSeen; ++i)
+            if (s_arSeen[i] == gbid)
+                return;
+        if (s_nSeen >= 512u)
+            return;
+        s_arSeen[s_nSeen++] = gbid;
+
+        const char *szName = "?";
+        if (GBIDToString != nullptr) {
+            auto        tName = GBIDToString(static_cast<GBID>(gbid), GB_ITEMS, 0);
+            const char *sz    = tName.str();
+            if (sz != nullptr && sz[0] != '\0')
+                szName = sz;
+        }
+        PRINT("[d3hack-gobcache] item in play: gbid=%08X name=\"%s\" (%u distinct)", gbid, szName,
+              s_nSeen)
+    }
+
+    inline auto StrLenSafe(const char *sz) -> int {
+        int n = 0;
+        if (sz == nullptr)
+            return 0;
+        while (sz[n] != '\0' && n < 4096)
+            ++n;
+        return n;
+    }
+
+    inline auto StrLowerEq(const char *a, const char *b) -> bool {
+        if (a == nullptr || b == nullptr)
+            return false;
+        for (;; ++a, ++b) {
+            char ca = *a;
+            char cb = *b;
+            if (ca >= 'A' && ca <= 'Z')
+                ca = static_cast<char>(ca + 32);
+            if (cb >= 'A' && cb <= 'Z')
+                cb = static_cast<char>(cb + 32);
+            if (ca != cb)
+                return false;
+            if (ca == '\0')
+                return true;
+        }
+    }
+
+    inline auto StrEndsWith(const char *sz, const char *szTail) -> bool {
+        const int nS = StrLenSafe(sz);
+        const int nT = StrLenSafe(szTail);
+        if (nT == 0 || nT > nS)
+            return false;
+        return StrLowerEq(sz + (nS - nT), szTail);
+    }
+
+    // The Items string list, by its global SNO. Returns null rather than the game's
+    // "!!Missing!!" placeholder so a failed lookup is a failure, not a name.
+    inline auto ItemDisplayName(const char *szInternal) -> const char * {
+        if (szInternal == nullptr || szInternal[0] == '\0')
+            return nullptr;
+        if (StringListFetchLPCSTR == nullptr || GlobalSNOGet == nullptr)
+            return nullptr;
+        const SNO snoList = GlobalSNOGet(GLOBALSNO_STRINGLIST_ITEMS);
+        if (snoList <= 0)
+            return nullptr;
+        const char *sz = StringListFetchLPCSTR(snoList, szInternal);
+        if (sz == nullptr || sz[0] == '\0')
+            return nullptr;
+        for (int i = 0; sz[i] != '\0' && i < 512; ++i)
+            if (sz[i] == '!' && sz[i + 1] == '!')
+                return nullptr;
+        return sz;
+    }
+
+    // Copies out, deliberately: GBIDToString hands back a CRefString BY VALUE, so the char*
+    // inside it belongs to a temporary that dies at the end of the statement. SnoName gets
+    // away with using it straight because it prints immediately; this name has to survive a
+    // second lookup and a compare.
+    inline auto ItemNameOfACD(ActorCommonData *tACD, u32 *pGbid, char *pchOut, int nMax) -> bool {
+        if (pchOut == nullptr || nMax < 2)
+            return false;
+        pchOut[0] = '\0';
+        auto *p   = reinterpret_cast<u8 *>(tACD);
+        if (reinterpret_cast<uintptr_t>(p) < 0x1000ull)
+            return false;
+        if (*reinterpret_cast<const s32 *>(p + 0x38) != 2)
+            return false;  // not an item ACD -- same test the free-sockets hook uses
+        const u32 gbid = *reinterpret_cast<const u32 *>(p + 0x3C);
+        if (pGbid != nullptr)
+            *pGbid = gbid;
+        if (GBIDToString == nullptr)
+            return false;
+        auto        tName = GBIDToString(static_cast<GBID>(gbid), GB_ITEMS, 0);
+        const char *sz    = tName.str();
+        if (sz == nullptr || sz[0] == '\0')
+            return false;
+        int i = 0;
+        for (; i < nMax - 1 && sz[i] != '\0'; ++i)
+            pchOut[i] = sz[i];
+        pchOut[i] = '\0';
+        return true;
+    }
+
+    // The two writes can arrive in either order, and on a world entry they do not have to be
+    // adjacent, so the item-passive powers are remembered and the match is retried from both
+    // sides. Bounded at 32 distinct powers (a session logged 31) and each is named at most
+    // once, the same discipline NamePowerOnce uses.
+    inline s32 s_arPassivePowers[32] = {};
+    inline int s_nPassivePowers      = 0;
+
+    inline void RememberPassivePower(s32 sno) {
+        if (sno <= 0 || s_nPassivePowers >= 32)
+            return;
+        for (int i = 0; i < s_nPassivePowers; ++i)
+            if (s_arPassivePowers[i] == sno)
+                return;
+        s_arPassivePowers[s_nPassivePowers++] = sno;
+    }
+
+    inline void TryBindGemPower() {
+        if (s_snoGoldGemPower != 0 || s_szGoldGemItem[0] == '\0')
+            return;
+        for (int i = 0; i < s_nPassivePowers; ++i) {
+            const char *szP = SnoName(s_arPassivePowers[i]);
+            if (szP == nullptr || !StrEndsWith(szP, s_szGoldGemItem))
+                continue;  // "ItemPassive_Unique_Gem_0NN_x1" ends with "Unique_Gem_0NN_x1"
+            s_snoGoldGemPower = s_arPassivePowers[i];
+            PRINT("[d3hack-gold] bound \"%s\" -> power %d \"%s\"", s_szGoldGemItem,
+                  s_snoGoldGemPower, szP)
+            return;
+        }
+    }
+
+    // Watches the two writes above. Cheap to call: one integer compare unless the attribute is
+    // actually one of the two, and everything after that runs at most a few dozen times.
+    inline void GoldGemNameWatch(ActorCommonData *tACD, FastAttribKey tKey, s32 nValue) {
+        const bool bProbe = global_config.rare_cheats.hoarder_gold_probe;
+        // Stays armed after the binding is made: the JEWEL_RANK cache is the fallback rank
+        // source, so it has to follow the gem when it is upgraded mid-session.
+        const bool bWant = global_config.rare_cheats.hoarder_gold_pct_per_rank > 0;
+        if (!bProbe && !bWant)
+            return;
+
+        const u32 uAttr = static_cast<u32>(KeyGetAttrib(tKey));
+
+        if (uAttr == 0x57Bu) {  // JEWEL_RANK, on the gem item itself
+            u32  gbid = 0;
+            char szItem[64] {};
+            if (!ItemNameOfACD(tACD, &gbid, szItem, sizeof(szItem)))
+                return;
+            // Already identified: refresh the rank and skip the string-list lookup.
+            if (s_szGoldGemItem[0] != '\0' && StrLowerEq(szItem, s_szGoldGemItem)) {
+                if (nValue > s_nGoldGemRank)
+                    s_nGoldGemRank = nValue;
+                return;
+            }
+            const char *szShown = ItemDisplayName(szItem);
+            static int  s_nJR   = 0;
+            if (bProbe && s_nJR < 40) {
+                ++s_nJR;
+                PRINT("[d3hack-gold] gem \"%s\" (\"%s\") gbid=%08X JEWEL_RANK=%d", szItem,
+                      (szShown != nullptr) ? szShown : "?", gbid, nValue)
+            }
+            const std::string &sWant = global_config.rare_cheats.hoarder_gold_gem_name;
+            if (sWant.empty())
+                return;
+            const bool bMatch = StrLowerEq(szItem, sWant.c_str()) ||
+                                (szShown != nullptr && StrLowerEq(szShown, sWant.c_str()));
+            if (!bMatch)
+                return;
+            for (int i = 0; i < 64; ++i) {
+                s_szGoldGemItem[i] = szItem[i];
+                if (szItem[i] == '\0')
+                    break;
+            }
+            s_szGoldGemItem[63] = '\0';
+            if (nValue > s_nGoldGemRank)
+                s_nGoldGemRank = nValue;
+            if (!s_bGoldGemReported) {
+                s_bGoldGemReported = true;
+                PRINT("[d3hack-gold] matched \"%s\" -> item \"%s\" rank %d", sWant.c_str(),
+                      s_szGoldGemItem, nValue)
+            }
+            TryBindGemPower();
+            return;
+        }
+
+        if (uAttr == 0x50Du && s_snoGoldGemPower == 0) {
+            RememberPassivePower(static_cast<s32>(KeyGetParam(tKey)));
+            TryBindGemPower();
+        }
+    }
+
+    // d3hack-custom: GOBLIN CACHE probes. Read-only, and they answer the two questions that
+    // stand between here and "goblins drop a Horadric cache alongside their own loot".
+    //
+    // What is already established, statically:
+    //   - A Horadric cache is an ORDINARY ITEM. The game's own Double-Bounty-Cache check at
+    //     0x89481C reads an item's SNO from [item+0x18] and compares it against
+    //     GlobalSNOGet(0x7D1 HoradricCacheA1 / 0x7CF BonusAct / 0x7D0 Greater), doubling the
+    //     stack on a match. So dropping the ITEM is enough -- the game's own open-the-cache
+    //     code then rolls the contents, and we never touch LootSpecifier, whose layout HANDOFF
+    //     records as known-wrong for 2.7.6.
+    //   - Goblins are GlobalSNO 0x7AE..0x7B3 (treasureGoblin_A/B/C/F/H/Anniversary).
+    //   - sym_FlippyDropCreateOnActor (0x7A4A00) creates a dropped item on an actor.
+    //   - sym_ExperienceDropLootForAll (0x7A1B00) is the candidate monster-death payout.
+    //
+    // What is NOT established, and is exactly what these log:
+    //   1. Whether 0x7A1B00 really is the death path, and which argument is the dying monster.
+    //   2. What FlippyDropCreateOnActor's arguments actually MEAN. Its prototype is not
+    //      declared anywhere and guessing it is the failure this project already paid for --
+    //      an install at a wrong signature corrupts even when the callback never runs. So
+    //      these are INLINE hooks reading raw registers: no prototype, nothing to get wrong,
+    //      and the meanings get read off real calls the game makes on its own.
+    //
+    // Neither probe writes anything. Both are gated on GoblinCacheProbe, default false.
+    // d3hack-custom: find the Horadric cache's ITEM GBID, by name, at runtime.
+    //
+    // What we have from the game's own Double-Bounty-Cache check at 0x89481C is the cache's
+    // ACTOR SNO -- GlobalSNOGet(0x7D1) = 360166. That is the WRONG NAMESPACE for what the drop
+    // path wants: LootSpecifier +8 is a GameBalance gbid, a hash of the item's internal name,
+    // and the loot roll's own gbids look like F9F6170B, nothing like an SNO. Mixing the two is
+    // a silent failure -- the roll would simply produce nothing.
+    //
+    // So do not compute the hash and do not guess the internal name. Walk GB_ITEMS and match on
+    // the name the game itself reports, exactly as the gem binding already does. One shot at
+    // runtime: AllGBIDsOfType is another of the calls that faults if made at install time.
+    inline void ReportCacheItemGbids() {
+        static bool s_done = false;
+        if (s_done)
+            return;
+        // AllGBIDsOfType is a plain function, not a resolved pointer, so it needs no null test
+        // (-Werror=address rejects one). GBIDToString IS a pointer and does.
+        if (GBIDToString == nullptr)
+            return;
+        s_done = true;
+
+        struct Local {
+            static auto ContainsNoCase(const char *sz, const char *szNeedle) -> bool {
+                for (int i = 0; sz[i] != '\0' && i < 256; ++i) {
+                    int j = 0;
+                    for (; szNeedle[j] != '\0'; ++j) {
+                        char a = sz[i + j];
+                        char b = szNeedle[j];
+                        if (a >= 'A' && a <= 'Z')
+                            a = static_cast<char>(a + 32);
+                        if (b >= 'A' && b <= 'Z')
+                            b = static_cast<char>(b + 32);
+                        if (a != b)
+                            break;
+                    }
+                    if (szNeedle[j] == '\0')
+                        return true;
+                }
+                return false;
+            }
+        };
+
+        std::vector<GBID> ids;
+        AllGBIDsOfType(static_cast<GameBalanceType>(0x2), ids);  // GB_ITEMS
+        int nFound = 0;
+        for (GBID g : ids) {
+            auto        tName = GBIDToString(g, GB_ITEMS, 0);
+            const char *sz    = tName.str();
+            if (sz == nullptr || sz[0] == '\0')
+                continue;
+            // d3hack-custom: also dump the Unique_<slot>_1NN block. Act 1's bounty exclusives
+            // came out of a real cache as Unique_Ring_107_x1 (Ring of Royal Grandeur),
+            // Unique_Shoulder_103_x1 (Pauldrons of the Skeleton King), Unique_Amulet_105_x1
+            // (Golden Gorget of Leoric) and Unique_Mace_1H_101_x1 (Mad Monarch's Scepter), so
+            // the 1NN range in each slot IS the bounty range. Dumping it by pattern beats
+            // looking up 25 display names and guessing their internal spellings -- the mapping
+            // from display name to internal name is the thing this project has never had.
+            const bool bCacheish = Local::ContainsNoCase(sz, "cache") ||
+                                   Local::ContainsNoCase(sz, "horadric") ||
+                                   Local::ContainsNoCase(sz, "bounty");
+            bool bUnique1xx = false;
+            if (Local::ContainsNoCase(sz, "unique_")) {
+                // any _1NN_ or trailing _1NN in the name
+                for (int i = 0; sz[i] != 0 && sz[i + 1] != 0 && sz[i + 2] != 0 && sz[i + 3] != 0; ++i) {
+                    if (sz[i] == '_' && sz[i + 1] == '1' && sz[i + 2] >= '0' && sz[i + 2] <= '9' &&
+                        sz[i + 3] >= '0' && sz[i + 3] <= '9') {
+                        bUnique1xx = true;
+                        break;
+                    }
+                }
+            }
+            if (!bCacheish && !bUnique1xx)
+                continue;
+            ++nFound;
+            // d3hack-custom: print the DISPLAY name too. Internal names carry no act and no
+            // English, so "which of these 502 is Ring of Royal Grandeur" has no offline answer
+            // -- the published bounty lists are all display names. ItemDisplayName came back
+            // null for gems, so it may well fail here too; if it does, the "?" says so plainly
+            // rather than leaving a guess in the log.
+            const char *szShown = ItemDisplayName(sz);
+            PRINT("[d3hack-gobcache] ITEM gbid=%08X name=\"%s\" display=\"%s\"",
+                  static_cast<u32>(g), sz, (szShown != nullptr) ? szShown : "?")
+        }
+        PRINT("[d3hack-gobcache] item scan: %d of %d GB_ITEMS matched cache/bounty or Unique_*_1NN",
+              nFound, static_cast<int>(ids.size()))
+    }
+
+    // !! NOT CALLABLE AT HOOK-INSTALL TIME. !! GlobalSNOGet resolves as a symbol during module
+    // init, but the table it reads is not built yet, so calling it there faults inside
+    // nn::init::Start before the game ever runs -- a boot crash with X0 holding the id you
+    // asked for and X1 holding 0x4E5E50. Cost one boot on 2026-09-06. It is called lazily from
+    // the probe callbacks instead, which are by definition runtime.
+    inline void ReportGoblinCacheIds() {
+        static bool s_done = false;
+        if (s_done)
+            return;
+        s_done = true;
+        if (GlobalSNOGet == nullptr) {
+            PRINT_LINE("[d3hack-gobcache] GlobalSNOGet unresolved -- cannot report ids");
+            return;
+        }
+        static const struct { u32 idx; const char *name; } k_ids[] = {
+            {0x7CFu, "HoradricCacheBonusAct"}, {0x7D0u, "GreaterHoradricCache"},
+            {0x7D1u, "HoradricCacheA1"},       {0x7D2u, "(A2?)"},
+            {0x7D3u, "(A3?)"},                 {0x7D4u, "(A4?)"},
+            {0x7D5u, "(A5?)"},                 {0x7DDu, "ChallengeRiftCache"},
+        };
+        for (const auto &e : k_ids) {
+            PRINT("[d3hack-gobcache] cache id 0x%X %-22s = %08X", e.idx, e.name,
+                  static_cast<unsigned>(GlobalSNOGet(static_cast<SNO>(e.idx))))
+        }
+        // 0x7D2..0x7D5 came back from globalsno.py with a duplicated unrelated name, so it is
+        // unknown whether the per-act caches exist as separate entries at all. Distinct gbids
+        // here settle it; identical or zero ones say the acts are derived some other way, and
+        // "always an Act 1 cache" would be a poor version of the feature.
+        for (u32 i = 0x7AEu; i <= 0x7B3u; ++i) {
+            PRINT("[d3hack-gobcache] goblin id 0x%X = %08X", i,
+                  static_cast<unsigned>(GlobalSNOGet(static_cast<SNO>(i))))
+        }
+        ReportCacheItemGbids();
+    }
+
+    // d3hack-custom: DISPROVEN 2026-09-06 and removed rather than left installed.
+    //
+    // Probe_DropLootForAll (0x7A1B00) and Probe_FlippyDrop (0x7A4A00) -- the two symbols
+    // offsets.hpp names for the death payout and the item drop -- fired ZERO times across
+    // 6202 logged kills. Both are real functions with real callers (4 and 1 respectively),
+    // so the addresses are sound; they are simply not on the path a dying monster takes in
+    // this build. The symbol names were aspirational. Do not re-probe them without a reason.
+    //
+    // The live path is the one the mod already rides for ancient/primal:
+    // LootRollForAncientLegendary (0x88DDE0), which demonstrably runs because primals drop.
+    // 0x88D33C rolls a specifier and hands the SAME pointer straight to 0x88E190, so that is
+    // the consumer candidate -- but "called right after" is not "materialises the item", and
+    // this project has paid for that kind of inference before.
+    //
+    // So: walk the stack from the roll. The chain above it IS the death-to-loot path, and one
+    // of those frames takes the dying monster. That is the frame the cache drop hooks, and
+    // one run names it instead of another round of static guessing.
+    HOOK_DEFINE_INLINE(Probe_LootRoll) {
+        static void Callback(exl::hook::InlineCtx *ctx) {
+            static u32 s_n = 0;
+            ++s_n;
+            ReportGoblinCacheIds();  // once, and only from runtime -- see the note on it
+            // 200, not 16: opening a Horadric cache rolls its whole table in one burst, and at
+            // 16 the interesting rolls fell outside the window. Ambient play still gets sampled
+            // by the modulo after that.
+            if (s_n > 200u && (s_n % 200u) != 0u)
+                return;
+            const auto uBase = GameOffset(0);
+            const auto x0    = static_cast<uintptr_t>(ctx->X[0]);
+            const auto uLr   = static_cast<uintptr_t>(ctx->X[30]);
+            u32        gbid  = 0;
+            s32        rank  = -1;
+            // Only +8 (item gbid) and +0xD8 (ancient rank) are proven offsets in
+            // LootSpecifier -- see the static_assert above. Read nothing else.
+            if (x0 >= 0x1000000000ull && x0 < 0x8000000000ull) {
+                gbid = *reinterpret_cast<const u32 *>(x0 + 8);
+                rank = *reinterpret_cast<const s32 *>(x0 + 0xD8);
+            }
+            // NOTE: this caller= is NOT trustworthy -- at an inline hook's entry x30 belongs to
+            // the trampoline, not the original call, and it printed +0x1B33410 (past the end of
+            // .text) on every line. The WalkStack chain is the real answer. Kept only so the
+            // field's uselessness is on the record instead of being rediscovered.
+            PRINT("[d3hack-gobcache] lootroll #%u spec=%016llX gbid=%08X ancientRank=%d caller?=+0x%06X",
+                  s_n, static_cast<unsigned long long>(x0), gbid, rank,
+                  (uLr > uBase) ? static_cast<u32>(uLr - uBase) : 0u)
+            // At the ENTRY of the function x29 is still the caller's frame, so this walks the
+            // chain above the roll -- which is the whole point.
+            if (s_n <= 6u)
+                WalkStack("lootroll", static_cast<uintptr_t>(ctx->X[29]));
+        }
+    };
+
+    // d3hack-custom: the goblin roster, from DiIiS ActorSno.cs, which is generated from game
+    // data. Two blocks exist -- legacy 5984.. and a modern 487312.. re-registration with the
+    // same letters -- and the 2026-09-06 census proved the LEGACY ids are what this build
+    // actually spawns (a, b, c, e, f, h all observed as victims). Both are listed anyway; an
+    // id that never appears costs one compare.
+    inline constexpr u32 k_arGoblinSno[] = {
+        5984u, 5985u, 5986u, 5987u,                       // a, b, backpack, c
+        326803u, 343046u, 391593u, 394196u, 405186u,      // a_slave, devilshand, g, inbackpack, tentacle
+        408354u, 408655u, 408989u, 410572u, 410574u,      // d_splitter, e, f, d_splitter_02/03
+        413289u, 428663u, 429161u, 434745u, 450993u,      // h, i, j, anniversary, k
+        487312u, 487313u, 487314u, 487315u, 487316u,      // modern a, b, c, f, h
+        487317u, 487318u,                                 // modern e, j
+    };
+
+    inline auto IsGoblinSno(u32 uSno) -> bool {
+        for (const u32 s : k_arGoblinSno)
+            if (s == uSno)
+                return true;
+        return false;
+    }
+
+    // Set by the victim probe at 0x8740B0 and read by the item-iterator probe, so the iterator
+    // only speaks while a goblin's loot is being handed out. 0x48C120 has nine callers and is
+    // not somewhere to log unconditionally.
+    inline bool s_bVictimGoblin = false;
+    // d3hack-custom: a COUNT, not a flag. The victim hook fires on every monster death, so a
+    // boolean armed by a goblin was being cleared by the next ordinary monster to die before the
+    // goblin's own loot roll arrived -- at 3x density that is almost immediate, and it is why
+    // the first armed run produced four goblin kills and zero swaps. Nothing clears this except
+    // the swap itself, so each goblin is eventually paid out even when rolls interleave. Capped
+    // so a long goblin streak cannot bank an absurd backlog -- the XP carry taught that lesson.
+    inline u32 s_nCachePending = 0u;
+    inline u32  s_uVictimSno    = 0u;
+    inline u32  s_nIterBudget   = 0u;
+
+    // d3hack-custom: a goblin's loot roll happens in the world the goblin died in, so a
+    // pending cache that outlives a world change belongs to a game that no longer exists.
+    // Left armed, it rewrites the gbid of the NEXT game's first loot roll instead.
+    //
+    // Measured 2026-09-06: the last goblin died at 20:08:02 leaving pending=6. A new game
+    // was created at 20:13:17, its world came up at 20:13:21, and at 20:13:23 a swap fired
+    // on victim 4062 reading "[#19, 3 still pending]" -- five minutes and one whole game
+    // after any goblin. The process aborted 0.11s later in the attribute serializer
+    // (0xA2C340, undefined instruction) on the inventory path.
+    //
+    // Called from sInitializeWorld beside ExpireGRLatchOnWorldChange.
+    inline void ResetGoblinCacheStateOnWorldChange() {
+        s_nCachePending = 0u;
+        s_uVictimSno    = 0u;
+        s_bVictimGoblin = false;
+        s_nIterBudget   = 0u;
+    }
+
+    // d3hack-custom: name whatever item the game is asking "is this a Horadric cache?" about.
+    //
+    // 0x8947E0 computes the item's gbid into w20 (`lsr x20, x24, #0x20`) and stores it with the
+    // GB type at sp+0x28 for the GBRecordGet at 0x89480C; the record's SNO at +0x18 is then
+    // compared against GlobalSNOGet(0x7D1/0x7CF/0x7D0) and a match doubles the stack. So this
+    // fires exactly when a cache is being handled, and w20 is the identity we want -- no offset
+    // into an unknown struct, no name guessing.
+    HOOK_DEFINE_INLINE(Probe_CacheCheck) {
+        static void Callback(exl::hook::InlineCtx *ctx) {
+            // Collapse runs of the same gbid. Death's Breath and friends arrive as long
+            // stacks, one call each, and at one line apiece they ate a 600-line budget before
+            // the cache-open block was reached. The instrumentation, not the test, was the
+            // problem. A run is reported once with its length when it ends.
+            static u32 s_n     = 0;
+            static u32 s_uLast = 0;
+            static u32 s_nRun  = 0;
+            const u32  gbid    = static_cast<u32>(ctx->X[20]);
+            if (gbid == s_uLast) {
+                ++s_nRun;
+                return;
+            }
+            const u32 nPrevRun = s_nRun;
+            s_uLast            = gbid;
+            s_nRun             = 1u;
+            if (nPrevRun > 1u)
+                PRINT("[d3hack-gobcache]   (previous item x%u)", nPrevRun)
+            if (++s_n > 600u)
+                return;
+            const char *szName = "?";
+            if (GBIDToString != nullptr) {
+                auto        tName = GBIDToString(static_cast<GBID>(gbid), GB_ITEMS, 0);
+                const char *sz    = tName.str();
+                if (sz != nullptr && sz[0] != '\0')
+                    szName = sz;
+            }
+            PRINT("[d3hack-gobcache] cache-check #%u: item gbid=%08X name=\"%s\"", s_n, gbid, szName)
+        }
+    };
+
+    // d3hack-custom: GOBLINS DROP A HORADRIC CACHE.
+    //
+    // Every piece of this was measured, not inferred:
+    //   - 0x8740B0 is the monster-side entry to loot generation. Found by agreeing from both
+    //     ends: statically 0x88D33C rolls a specifier, and a runtime WalkStack from that roll
+    //     came back through 0x8744D0 <- 0x876E40, and 0x8740B0's caller 0x876E3C returns to
+    //     0x876E40. The victim's actor SNO is at x0+0x04, read off a real goblin (0x1760).
+    //   - LootSpecifier +8 is the item gbid. That is one of only TWO offsets in that struct
+    //     this project has ever proven (the other being eAncientRank at +0xD8); the declared
+    //     layout is known-wrong for 2.7.6, so nothing else in it is touched.
+    //   - The cache gbid came from walking GB_ITEMS and matching the name the game itself
+    //     reports -- NOT from hashing a guessed internal name, and NOT from the cache's actor
+    //     SNO (360166), which is a different namespace and would have failed silently.
+    //
+    // Why here and not a manufactured drop: rewriting +8 at the roll means 0x88E190 and the
+    // affix code at 0x88D398 both run afterwards against the NEW gbid, so the game builds the
+    // cache with its own machinery. Two attempts at manufacturing a drop were eliminated first
+    // -- see HANDOFF -- and both would have meant constructing a call from static reading alone.
+    //
+    // It converts ONE of the goblin's drops rather than adding one. Truly additive needs the
+    // 0xF0-stride specifier array at 0x895670 grown, which needs its count and capacity, which
+    // are not known. A goblin drops plenty; one of them becoming a cache is the better trade.
+    HOOK_DEFINE_INLINE(GoblinCacheSwap) {
+        static void Callback(exl::hook::InlineCtx *ctx) {
+            if (s_nCachePending == 0u)
+                return;
+            const auto pSpec = static_cast<uintptr_t>(ctx->X[0]);
+            if (pSpec < 0x1000000000ull || pSpec >= 0x8000000000ull)
+                return;
+            // d3hack-custom: the per-act Torment13 caches, the highest tier that exists.
+            //
+            // GreaterHoradricCache rolls from all five acts but ONLY exists as base and
+            // "Torment" (= Torment 1) -- there is no GreaterHoradricCacheTorment13 -- so on a
+            // high-torment character it is the wrong item, which is what the first armed build
+            // got wrong. The per-act caches DO go to Torment13, so rotate them instead: one act
+            // per goblin, all five covered, every one at max tier. All five gbids came from the
+            // GB_ITEMS name scan, not from arithmetic on a base value.
+            // TWO naming schemes exist and they do NOT reach the same ceiling:
+            //   HoradricCacheA{N}Torment{1..13}   -- stops at 13
+            //   DoubleBountyBagAct{N}T{1..16}     -- goes to 16
+            // So T16 only exists under the second one. Every gbid below was read verbatim out
+            // of the GB_ITEMS name scan; none was derived by adding to a base, because hex
+            // arithmetic by hand has been wrong twice in this project already.
+            // d3hack-custom: drop the LEGENDARIES, not a cache.
+            //
+            // Manufacturing a cache does not work, and the reason is structural rather than a
+            // wrong gbid. We hijack a specifier the game had already built for the goblin's
+            // original drop and change exactly ONE field, the gbid at +8. A real Horadric cache
+            // evidently carries the act/difficulty it was earned at somewhere else in the item;
+            // ours inherits whatever the goblin was going to drop. Opened, it rolls the generic
+            // contents -- mats, reagent, relic -- and never the act legendary. Real caches
+            // opened on the same character DID give one every time, which is what isolates it.
+            //
+            // So skip the container. These are ordinary legendaries and the swap already places
+            // them correctly; affixes roll afterwards, so they can still come out ancient or
+            // primal. Every gbid here was read out of a real cache's contents log, not guessed.
+            //
+            // The cache gbids, if the act field is ever located:
+            //   DoubleBountyBag T16: 0915D9CA 0916662B 0916F28C 09177EED 09180B4E
+            // d3hack-custom: THE COMPLETE BOUNTY-CACHE LEGENDARY SET -- all 21.
+            //
+            // Each gbid was established in three independent steps, none of them guessed:
+            //   1. display name + act, from the published bounty lists
+            //   2. display name -> internal name, from the Blizzard game-guide URL, which
+            //      embeds it (.../item/gloves-of-worship-Unique_Gloves_103_x1)
+            //   3. internal name -> gbid, from this build's own GB_ITEMS scan
+            // Step 2 is the bridge this project never had: ItemDisplayName resolves NOTHING
+            // (0 of 854 tried), so internal-to-display cannot be done from game data alone.
+            // Act 4 is absent on purpose -- its cache has no exclusives, it draws from the rest.
+            static constexpr u32 k_arCacheT13[] = {
+                // Act 1
+                0x915D8A1Du,  // Unique_Mace_1H_101_x1   Mad Monarch's Scepter
+                0xBB7A9825u,  // Unique_Ring_107_x1      Ring of Royal Grandeur
+                0x8D864C77u,  // Unique_Shoulder_103_x1  Pauldrons of the Skeleton King
+                0x5D5DFA9Bu,  // Unique_Amulet_105_x1    Golden Gorget of Leoric
+                0x395CEA02u,  // Unique_Bracer_105_x1    Sanguinary Vambraces
+                // Act 2
+                0x0BF43D8Eu,  // Unique_Shield_107_x1    Coven's Criterion
+                0x249F5461u,  // Unique_Gloves_103_x1    Gloves of Worship
+                0x0F8B833Au,  // Unique_Cloak_102_x1     Cloak of Deception
+                0x75F9DC18u,  // Unique_Boots_103_x1     Illusory Boots
+                // Act 3
+                0xA59CB488u,  // Unique_Axe_2H_103_x1    Burst of Wrath
+                0x75F94FB7u,  // Unique_Boots_102_x1     Boots of Disregard
+                0x164128D7u,  // Unique_Helm_103_x1      Pride's Fall
+                0xC84734DBu,  // Unique_Dagger_103_x1    Envious Blade
+                0xBB7B2486u,  // Unique_Ring_108_x1      Avarice Band
+                0x6BE1BB78u,  // Unique_Belt_103_x1      Insatiable Belt
+                0x5D5E86FCu,  // Unique_Amulet_106_x1    Overwhelming Desire
+                // Act 5
+                0xD42BF056u,  // Unique_Pants_102_x1     Death's Bargain
+                0x05DBA041u,  // Unique_Mace_2H_104_x1   Soulsmasher
+                0xBD9327ABu,  // Unique_HandXBow_102_x1  Helltrapper
+                0x30EBAAB9u,  // Unique_CruShield_108_x1 Salvation
+                0xBB7BB0E7u,  // Unique_Ring_109_x1      Pandemonium Loop
+            };
+            static u32 s_nAct = 0;
+            const u32  uCfg   = static_cast<u32>(global_config.rare_cheats.goblin_cache_gbid);
+            // 0 (the default) means rotate; any other value pins one specific cache.
+            const u32  uWant  = (uCfg != 0u) ? uCfg : k_arCacheT13[s_nAct % 21u];
+            if (uCfg == 0u)
+                ++s_nAct;
+            if (uWant == 0u)
+                return;
+            --s_nCachePending;  // one per goblin, not one per drop
+            auto     *pGbid = reinterpret_cast<u32 *>(pSpec + 8);
+            const u32 uWas  = *pGbid;
+            *pGbid          = uWant;
+            static u32 s_nSwaps = 0;
+            if (++s_nSwaps <= 20u || (s_nSwaps % 50u) == 0u) {
+                // NOT "goblin %u": the pending count deliberately survives intervening
+                // deaths, so the victim at swap time is usually some ordinary monster that
+                // died after the goblin. Saying "goblin" here invited exactly the misreading
+                // this project keeps paying for.
+                PRINT("[d3hack-gobcache] swap on victim %u: drop gbid %08X -> %08X (cache) "
+                      "[#%u, %u still pending]",
+                      s_uVictimSno, uWas, uWant, s_nSwaps, s_nCachePending)
+            }
+        }
+    };
+
+    // d3hack-custom: the VICTIM probe -- 0x8740B0.
+    //
+    // Found by agreeing from both ends, which is why it is worth trusting:
+    //   - statically, 0x88D33C rolls a specifier (frame [0] of the walk is 0x88D340, exactly
+    //     the instruction after that call);
+    //   - at runtime, WalkStack from the roll gave 88D340 <- 895670 <- 896B04 <- 88FBB0 <-
+    //     88B860 <- 496E9C <- 497430 <- 8744D0 <- 876E40 <- 876A20 <- the sim tick;
+    //   - 0x8744D0 sits inside the function at 0x8740B0, and 0x8740B0's caller 0x876E3C
+    //     returns to 0x876E40, which IS frame [8].
+    // So 0x8740B0 is the monster-side entry into loot generation.
+    //
+    // What is NOT known is which argument holds the dying monster, or where its SNO sits in
+    // that struct. So this logs the raw registers and a window of memory and lets the DATA
+    // say it: the goblin SNOs are now known exactly -- 0x1760/0x1761/0x1763 (treasureGoblin
+    // A/B/C, which match DiIiS's independent table at 5984/5985/5987) and 0x63D9D/0x64E69/
+    // 0x6A239 -- so on a goblin kill one of these words will BE one of those, naming both the
+    // argument and the offset in a single line. No offset is assumed anywhere below.
+    HOOK_DEFINE_INLINE(Probe_MonsterLoot) {
+        static void Callback(exl::hook::InlineCtx *ctx) {
+            static u32 s_n = 0;
+            ++s_n;
+
+            // d3hack-custom: VICTIM CENSUS. +0x04 is the dying actor's SNO -- proven on a real
+            // goblin kill (0x1760 = 5984 = treasuregoblin_a), not inferred. Printing one line
+            // per DISTINCT sno costs nothing and answers the question the sampled dumps could
+            // not: the dump fires for the first 12 kills and every 100th after, so almost every
+            // goblin was missed. There are ~45 goblin actors across two SNO blocks and it is
+            // not known which of them this build actually spawns, so census them all and let
+            // the log say it rather than trusting a name table that has already drifted once.
+            {
+                static u32 s_arSeen[192] {};
+                static u32 s_nSeen = 0;
+                const auto p0      = static_cast<uintptr_t>(ctx->X[0]);
+                if (p0 >= 0x1000000000ull && p0 < 0x8000000000ull) {
+                    const u32 uSno = *reinterpret_cast<const u32 *>(p0 + 4);
+                    // Arm the item-iterator probe for exactly this victim's loot.
+                    s_uVictimSno    = uSno;
+                    s_bVictimGoblin = IsGoblinSno(uSno);
+                    if (s_bVictimGoblin) {
+                        s_nIterBudget   = 40u;
+                        if (global_config.rare_cheats.goblin_cache_drop && s_nCachePending < 32u) {
+                            ++s_nCachePending;
+                            static u32 s_nArmed = 0;
+                            if (++s_nArmed <= 20u || (s_nArmed % 50u) == 0u) {
+                                PRINT("[d3hack-gobcache] goblin %u died -- cache armed (pending=%u, armed=%u)",
+                                      uSno, s_nCachePending, s_nArmed)
+                            }
+                        }
+                        if (global_config.rare_cheats.goblin_cache_probe) {
+                            PRINT("[d3hack-gobcache] GOBLIN victim sno=%u -- arming item iterator", uSno)
+                        }
+                    }
+                    if (global_config.rare_cheats.goblin_cache_probe && uSno != 0u &&
+                        uSno != 0xFFFFFFFFu) {
+                        bool bNew = true;
+                        for (u32 i = 0; i < s_nSeen; ++i) {
+                            if (s_arSeen[i] == uSno) {
+                                bNew = false;
+                                break;
+                            }
+                        }
+                        if (bNew && s_nSeen < 192u) {
+                            s_arSeen[s_nSeen++] = uSno;
+                            PRINT("[d3hack-gobcache] victim sno=%u (0x%X) -- NEW, %u distinct so far",
+                                  uSno, uSno, s_nSeen)
+                        }
+                    }
+                }
+            }
+
+            if (!global_config.rare_cheats.goblin_cache_probe)
+                return;
+            if (s_n > 12u && (s_n % 100u) != 0u)
+                return;
+            PRINT("[d3hack-gobcache] victim #%u x0=%016llX x1=%016llX x2=%016llX x3=%016llX", s_n,
+                  static_cast<unsigned long long>(ctx->X[0]), static_cast<unsigned long long>(ctx->X[1]),
+                  static_cast<unsigned long long>(ctx->X[2]), static_cast<unsigned long long>(ctx->X[3]))
+            for (int i = 0; i < 2; ++i) {
+                const auto p = static_cast<uintptr_t>(ctx->X[i]);
+                if (p < 0x1000000000ull || p >= 0x8000000000ull)
+                    continue;
+                const auto *w = reinterpret_cast<const u32 *>(p);
+                for (int r = 0; r < 4; ++r) {
+                    PRINT("[d3hack-gobcache]   x%d+0x%02X %08X %08X %08X %08X %08X %08X %08X %08X",
+                          i, r * 32, w[r * 8 + 0], w[r * 8 + 1], w[r * 8 + 2], w[r * 8 + 3],
+                          w[r * 8 + 4], w[r * 8 + 5], w[r * 8 + 6], w[r * 8 + 7])
+                }
+            }
+        }
+    };
+
+    // d3hack-custom: what is in the goblin's drop list?
+    //
+    // 0x8744B0, inside the victim function, runs
+    //     for (i = 0;; ++i) { id = 0x48C120(x23, i); if (id == -1) break; 0x497330(w22, id); }
+    // which is an existing collection being handed out one entry at a time, already running on
+    // every goblin kill. If those ids are the things that become dropped items, then APPENDING
+    // to that collection is the whole feature -- the game's own creation machinery does the
+    // rest, no invented call and no params buffer to reverse.
+    //
+    // Signature read off the call site, not guessed: x0 is the collection, w1 the index, and
+    // the caller tests the result with `cmn w0,#1`, so it returns a signed id with -1 as the
+    // terminator. Trampoline rather than inline because the RETURN VALUE is the whole point.
+    //
+    // Gated on the victim being a goblin: 0x48C120 has nine callers and is not a place to log
+    // unconditionally. The cost when not armed is one bool test.
+    HOOK_DEFINE_TRAMPOLINE(Probe_ItemIter) {
+        static auto Callback(void *pColl, s32 nIndex) -> s32 {
+            const s32 nId = Orig(pColl, nIndex);
+            if (!s_bVictimGoblin || s_nIterBudget == 0u)
+                return nId;
+            --s_nIterBudget;
+            // Cache identities for comparison, resolved lazily at runtime (GlobalSNOGet is not
+            // callable at install time -- see the note on ReportGoblinCacheIds).
+            u32 uCacheA1 = 0u;
+            if (GlobalSNOGet != nullptr)
+                uCacheA1 = static_cast<u32>(GlobalSNOGet(static_cast<SNO>(0x7D1)));
+            PRINT("[d3hack-gobcache] iter victim=%u coll=%016llX idx=%d -> id=%d (0x%X)%s",
+                  s_uVictimSno, static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(pColl)),
+                  nIndex, nId, static_cast<u32>(nId),
+                  (uCacheA1 != 0u && static_cast<u32>(nId) == uCacheA1) ? "  <-- IS HoradricCacheA1" : "")
+            return nId;
+        }
+    };
+
     HOOK_DEFINE_TRAMPOLINE(EliteEventProbe) {
         static void Callback(ActorCommonData *tACD, FastAttribKey tKey, s32 nValue) {
+            ItemCensus(tACD);  // d3hack-custom
+            GoldGemNameWatch(tACD, tKey, nValue);
             // d3hack-custom: name the active legendary powers. ITEM_POWER_PASSIVE (0x50D) is
             // written per equipped legendary, with the POWER SNO as the key's param -- so this
             // both proves the attribute works and hands over the SNOs for Gloves of Worship and
             // Flavor of Time without guessing at item tables.
-            if (global_config.rare_cheats.shrine_duration_probe) {
+            if (global_config.rare_cheats.shrine_duration_probe ||
+                global_config.rare_cheats.hoarder_gold_probe) {
                 const u32 uA2 = static_cast<u32>(KeyGetAttrib(tKey));
                 if (uA2 == 0x50Du && nValue != 0) {
                     const s32   snoP = static_cast<s32>(KeyGetParam(tKey));
@@ -10704,6 +12141,11 @@ namespace d3 {
     // "has engaged Thundering Damned Herald".
     HOOK_DEFINE_TRAMPOLINE(EliteEventProbeFloat) {
         static void Callback(ActorCommonData *tACD, FastAttribKey tKey, float flValue) {
+            // d3hack-custom: 0x50D is read back as a FLOAT elsewhere in this file, so the gem
+            // binding has to watch both setters or it depends on which one the item layer
+            // happens to use.
+            ItemCensus(tACD);  // d3hack-custom
+            GoldGemNameWatch(tACD, tKey, static_cast<s32>(flValue));
             // d3hack-custom: is a buff timer written as a FLOAT? Last cheap check -- see the
             // note above the AttrGetInt hook for the three routes already ruled out.
             if (global_config.rare_cheats.shrine_duration_probe) {
@@ -11645,12 +13087,324 @@ namespace d3 {
             const u32 gbid = *reinterpret_cast<const u32 *>(p + 0x3C);
             if (!std::binary_search(d3::g_arEquippableGbids.begin(), d3::g_arEquippableGbids.end(), gbid))
                 return ret;  // not equippable
-            static int s_n = 0;
-            if (s_n < 10) {
-                ++s_n;
-                PRINT("[d3hack-custom] free sockets: gbid %08X %d -> %d", gbid, ret, nWant)
+            static int s_n = 0;
+            if (s_n < 10) {
+                ++s_n;
+                PRINT("[d3hack-custom] free sockets: gbid %08X %d -> %d", gbid, ret, nWant)
+            }
+            return nWant;
+        }
+    };
+
+    // d3hack-custom: COSMETIC PET -- speed and gold pickup radius.
+    //
+    // The pet is its OWN actor. The player's GOLD_PICKUP_RADIUS is a different number on a
+    // different ACD, so overriding it does nothing for the pet and is deliberately left alone.
+    //
+    // WHAT IS NOT ESTABLISHED. Which attributes a cosmetic pet reads has not been measured.
+    // These are the plausible candidates -- the movement scalars at 0xAB/0xAC/0xAD/0xB1/0xB9
+    // and GOLD_PICKUP_RADIUS at 0x434. Every branch logs the first few times it actually
+    // CHANGES a value, so one run distinguishes "working" from "never asked". If none of those
+    // lines appear, PetProbe lists what the pet does read and the next pass is driven by data
+    // instead of another guess. Do not widen the attribute list without a probe run first.
+    //
+    // Pet identity: PET_OWNER (0x1DE) is the owner's ACD id and is non-zero only on a pet;
+    // PET_TYPE (0x1E0) is checked as a fallback. Both are INT attributes, so they are read
+    // through ACD_AttributesGetInt -- never through this hook, which would recurse forever.
+    // 2026-09-07: the first version tested PET_OWNER != 0 OR PET_TYPE != 0 and matched the
+    // PLAYER -- RUNNING_RATE_TOTAL (0xB1) 1.140 was scaled to 3.420 and the player ran at 3x.
+    // So at least one of those two is set on a player who has a pet out, which is the opposite
+    // of what the names suggest. PET_TYPE is dropped; PET_OWNER alone is the test, because
+    // "who owns me" is the only one of the two that cannot describe an owner.
+    //
+    // That is still an inference. PetProbe now prints both values plus the actor-type field at
+    // +0x38 for every DISTINCT ACD this accepts, so the next run states which discriminator is
+    // real instead of me guessing a third time. Until that run says otherwise, treat the
+    // speed and radius knobs as unproven.
+    inline auto PetOwnerOf(void *pObj) -> int {
+        if (reinterpret_cast<uintptr_t>(pObj) < 0x1000ull || ACD_AttributesGetInt == nullptr)
+            return 0;
+        return static_cast<int>(ACD_AttributesGetInt(static_cast<ActorCommonData *>(pObj),
+                                                     MakeAttribKey(static_cast<Attrib>(0x1DE), -1)));
+    }
+
+    inline auto PetTypeOf(void *pObj) -> int {
+        if (reinterpret_cast<uintptr_t>(pObj) < 0x1000ull || ACD_AttributesGetInt == nullptr)
+            return 0;
+        return static_cast<int>(ACD_AttributesGetInt(static_cast<ActorCommonData *>(pObj),
+                                                     MakeAttribKey(static_cast<Attrib>(0x1E0), -1)));
+    }
+
+    // 2026-09-07, run 2: PET_OWNER and PET_TYPE both read -1 on EVERY actor -- player, items,
+    // everything. -1 is the getter's "attribute not present" sentinel, not a value. The first
+    // test was `!= 0`, which accepts -1, so it matched everything and tripled the PLAYER's
+    // RUNNING_RATE_TOTAL. Strictly positive is the only safe reading of an ACD id.
+    // 2026-09-07, run 3 SETTLED IT. Four distinct tuples were seen among actors that read
+    // 0xB0/0xB1/0x434:
+    //
+    //     actorType=-1  PET_OWNER=-1  PET_TYPE=-1     attributes absent
+    //     actorType=4   PET_OWNER=0   PET_TYPE=0      the PLAYER -- has them, both zero
+    //     actorType=7   PET_OWNER=-1  PET_TYPE=-1     attributes absent
+    //     actorType=-1  PET_OWNER=0   PET_TYPE=25     the cosmetic PET
+    //
+    // PET_OWNER is never positive on anything, so the previous `PET_OWNER > 0` test would have
+    // matched nothing and both knobs would have been a silent no-op -- the exact failure this
+    // project keeps paying for, caught here by a probe run instead of by a wasted session.
+    //
+    // PET_TYPE > 0 is the discriminator, and it is SAFE in the way the first attempt was not:
+    // the player reads PET_TYPE = 0, so the runaway-player-speed bug cannot recur through this
+    // path. Note class minions (Witch Doctor dogs, Necromancer skeletons) are pets too and will
+    // legitimately match; only movement totals and gold pickup radius are affected.
+    inline auto IsPetAcd(void *pObj) -> bool { return PetTypeOf(pObj) > 0; }
+
+    // One line per distinct ACD accepted as a pet, with everything needed to tell a pet from a
+    // player. Distinct-ACD keyed, so it cannot flood.
+    // Distinct (actorType, PET_OWNER, PET_TYPE) TUPLES, not distinct ACDs. Run 2 filled all
+    // 16 report slots with item ACDs that were identical (2,-1,-1) and told us nothing new.
+    // Collapsing by tuple means every item is one line and a genuine pet cannot be crowded out.
+    inline void PetIdentityReport(void *pObj) {
+        struct Tup { s32 t; int o; int y; };
+        static Tup s_ar[32] {};
+        static int s_n = 0;
+        const s32  nActorType = *reinterpret_cast<const s32 *>(static_cast<u8 *>(pObj) + 0x38);
+        const int  nOwner     = PetOwnerOf(pObj);
+        const int  nType      = PetTypeOf(pObj);
+        for (int i = 0; i < s_n; ++i)
+            if (s_ar[i].t == nActorType && s_ar[i].o == nOwner && s_ar[i].y == nType)
+                return;
+        if (s_n >= 32)
+            return;
+        s_ar[s_n++] = Tup {nActorType, nOwner, nType};
+        PRINT("[d3hack-pet] actorType(+0x38)=%d PET_OWNER=%d PET_TYPE=%d  (%d distinct, ACD %p)",
+              static_cast<int>(nActorType), nOwner, nType, s_n, pObj)
+    }
+
+    HOOK_DEFINE_TRAMPOLINE(AttrGetFloatPet) {
+        static auto Callback(ActorCommonData *pACD, FastAttribKey tKey) -> float {
+            const float ret = Orig(pACD, tKey);
+            void *const pObj = static_cast<void *>(pACD);
+
+            const int   nSpeed  = global_config.rare_cheats.pet_speed_percent;
+            const float flRad   = global_config.rare_cheats.pet_pickup_radius;
+            const bool  bProbe  = global_config.rare_cheats.pet_probe;
+            if (nSpeed <= 100 && flRad <= 0.0f && !bProbe)
+                return ret;
+
+            const u32 uAttr = static_cast<u32>(KeyGetAttrib(tKey));
+            // WALKING_RATE_TOTAL / RUNNING_RATE_TOTAL. Run 1 measured 0xAB/0xAC/0xAD at 0.000
+            // on every actor -- they are not the live values -- and 0xB0/0xB1 carried real
+            // numbers, so only the totals are touched.
+            const bool bMove = (uAttr == 0xB0 || uAttr == 0xB1);
+            const bool bRad  = (uAttr == 0x434);
+            if (!bMove && !bRad)
+                return ret;
+            // Identity costs two int-getter calls, so it happens only for those two attributes
+            // and never on the general read path.
+            if (bProbe)
+                PetIdentityReport(pObj);
+            if (!IsPetAcd(pObj))
+                return ret;
+
+            if (bRad && flRad > 0.0f && flRad > ret) {
+                static int s_nR = 0;
+                if (s_nR < 4) {
+                    ++s_nR;
+                    PRINT("[d3hack-pet] pickup radius %d.%03d -> %d.%03d",
+                          static_cast<int>(ret), static_cast<int>((ret < 0 ? -ret : ret) * 1000.0f) % 1000,
+                          static_cast<int>(flRad), static_cast<int>(flRad * 1000.0f) % 1000)
+                }
+                return flRad;
             }
-            return nWant;
+
+            if (bMove && nSpeed > 100 && ret > 0.0f) {
+                const float flOut = ret * (static_cast<float>(nSpeed) / 100.0f);
+                static int  s_nS  = 0;
+                if (s_nS < 8) {
+                    ++s_nS;
+                    PRINT("[d3hack-pet] speed attr 0x%03X %d.%03d -> %d.%03d (x%d%%)", uAttr,
+                          static_cast<int>(ret), static_cast<int>(ret * 1000.0f) % 1000,
+                          static_cast<int>(flOut), static_cast<int>(flOut * 1000.0f) % 1000, nSpeed)
+                }
+                return flOut;
+            }
+            return ret;
+        }
+    };
+
+    // d3hack-custom: gold that keeps scaling with a legendary gem's RANK.
+    //
+    // Boon of the Hoarder's gold bonus is a per-rank number, and this fork lets gems run far
+    // past 150 (`LegendaryGemMaxLevel = 10000`). Whatever the gem's own numbers do up there,
+    // this adds a rank-driven multiplier on top of the gold the player actually receives, so
+    // rank keeps buying something after the stock curve stops mattering.
+    //
+    // WHERE IT SITS. ACD_ModifyCurrencyAmount is the single door every gold change comes
+    // through. It is hooked instead of the loot drop path because the drop path is NOT
+    // identified: the LootSpecifier layout in types/common.hpp is known-wrong for 2.7.6 (see
+    // HANDOFF -- only eAncientRank and the raw +8 GBID are proven), so writing nGoldAmount
+    // there would be a guess at an offset. Scaling at the door also keeps the pile on the
+    // floor and the number in the purse consistent, because there is only one edit.
+    //
+    // WHAT IDENTIFIES THE GEM. ITEM_POWER_PASSIVE (0x50D) is written per equipped legendary
+    // with the POWER SNO as the key's param -- proven for set bonuses (a set bonus IS
+    // `ITEM_POWER_PASSIVE[powerSNO] = 1`) and read as a float by the Shadow set fix at
+    // MakeAttribKey(0x50D, kShadowGatedPower). For a gem the param is its
+    // ItemPassive_Unique_Gem_0NN_x1 power.
+    //
+    // The SNO is a CONFIG value, not a constant in here, because which NN is Boon of the
+    // Hoarder is not derivable offline: the romfs container's name pool does not line up
+    // with its records (records are not 1:1 with names -- language variants of one .stl come
+    // back with different SNOs, and assets split across records), and the gem's description
+    // strings are in the ~15% of records that use the second codec, whose preset dictionary
+    // we do not have. `HoarderGoldProbe` prints the gem item's own name next to its rank and
+    // next to the power SNO that carries it, which settles it in one run.
+    //
+    // Only ever RAISES a positive grant. Spends, refunds and every other currency type pass
+    // through untouched, and with the percent at 0 (the default) the callback returns before
+    // it reads anything.
+    inline auto ItemPassiveRankOf(ActorCommonData *tACD, s32 snoPower) -> int {
+        if (tACD == nullptr || snoPower <= 0 || ACD_AttributesGetFloat == nullptr)
+            return 0;
+        const float fl = ACD_AttributesGetFloat(tACD, MakeAttribKey(0x50D, snoPower));
+        if (fl <= 0.0f)
+            return 0;
+        return static_cast<int>(fl);
+    }
+
+    HOOK_DEFINE_TRAMPOLINE(GemRankGoldGrant) {
+        //@ BOOL ACD_ModifyCurrencyAmount(ActorCommonData *tACD, const int64 nAmount,
+        //                                const CurrencyType eCurrencyType,
+        //                                const GoldModifiedReason eReason, const BOOL bForceNoSound)
+        static auto Callback(ActorCommonData *tACD, const int64 nAmount,
+                             const CurrencyType eCurrencyType, const GoldModifiedReason eReason,
+                             const BOOL bForceNoSound) -> BOOL {
+            const int nPct   = global_config.rare_cheats.hoarder_gold_pct_per_rank;
+            // Configured SNO wins; otherwise use the one bound by name from the gem's own
+            // attribute writes. Zero means "not identified yet", not "off".
+            const int nCfgSno = global_config.rare_cheats.hoarder_gold_power_sno;
+            const int nSno   = (nCfgSno > 0) ? nCfgSno : s_snoGoldGemPower;
+            const int nMin   = global_config.rare_cheats.hoarder_gold_min_rank;
+            const int nCur   = global_config.rare_cheats.hoarder_gold_currency;
+            const bool bOn   = (nPct > 0 && nSno > 0);
+            const bool bProbe = global_config.rare_cheats.hoarder_gold_probe;
+
+            // One line for the very first grant of each (currency, reason) pair, even with the
+            // probe off, whenever the feature is armed. Without it a wrong HoarderGoldCurrency
+            // is indistinguishable from "the mod did not load" -- the failure this project has
+            // paid for repeatedly. A per-pair bitmap cannot be starved by the loud pairs.
+            if ((bProbe || bOn) && nAmount != 0) {
+                static u32 s_uSeen[8] {};
+                const u32  uPair = (static_cast<u32>(eCurrencyType) & 0xFu) |
+                                  ((static_cast<u32>(eReason) & 0x1Fu) << 4);
+                if (uPair < 256u) {
+                    const u32 uBit = 1u << (uPair & 31u);
+                    if ((s_uSeen[uPair >> 5] & uBit) == 0u) {
+                        s_uSeen[uPair >> 5] |= uBit;
+                        PRINT("[d3hack-gold] grant %+lld currency=%d reason=%d caller +0x%lX",
+                              static_cast<long long>(nAmount), static_cast<int>(eCurrencyType),
+                              static_cast<int>(eReason),
+                              reinterpret_cast<u64>(__builtin_return_address(0)) -
+                                  exl::util::modules::GetTargetStart())
+                    }
+                }
+            }
+
+            // Armed but the gem has not named itself yet. Say so once rather than looking
+            // exactly like a feature that is switched off -- silence is indistinguishable
+            // from "the mod did not load", which this project has been bitten by before.
+            if (nPct > 0 && nSno <= 0 && nAmount > 0) {
+                static bool s_bUnbound = false;
+                if (!s_bUnbound) {
+                    s_bUnbound = true;
+                    PRINT("[d3hack-gold] armed (+%d%%/rank) but no gem bound yet: no JEWEL_RANK "
+                          "write has named \"%s\". Set HoarderGoldPowerSno by hand, or turn "
+                          "HoarderGoldProbe on to see which gems the game announces.",
+                          nPct, global_config.rare_cheats.hoarder_gold_gem_name.c_str())
+                }
+            }
+
+            // d3hack-custom: FLAT gold multiplier -- no gem, no rank, works from level 1.
+            // 100 = off, and off is the default. It targets the same currency id the gem
+            // feature does (HoarderGoldCurrency, 0 = gold) so this file keeps ONE answer to
+            // "which id is gold" rather than two that can drift apart.
+            const int  nFlat = global_config.rare_cheats.gold_multiplier_percent;
+            const bool bFlat = (nFlat > 100);
+
+            if (nAmount <= 0 || static_cast<int>(eCurrencyType) != nCur)
+                return Orig(tACD, nAmount, eCurrencyType, eReason, bForceNoSound);
+            if (!bOn && !bFlat)
+                return Orig(tACD, nAmount, eCurrencyType, eReason, bForceNoSound);
+
+            // The two compose multiplicatively; either one alone is the other sitting at 100.
+            // nAmount > 0 above is what keeps this a pickup multiplier and not a price rise --
+            // spends arrive negative and have already returned.
+            int nMult = bFlat ? nFlat : 100;
+
+            if (bOn) {
+                // 0x50D answers "is this gem equipped" (0 = no). Whether it also carries the
+                // RANK is the one thing about this feature a run has to settle, so when it
+                // reads as a bare flag the rank comes from the gem's own JEWEL_RANK instead.
+                int nRank = ItemPassiveRankOf(tACD, nSno);
+                if (nRank > 0 && nRank <= 1 && s_nGoldGemRank > 1) {
+                    static bool s_bSaidFlag = false;
+                    if (!s_bSaidFlag) {
+                        s_bSaidFlag = true;
+                        PRINT("[d3hack-gold] ITEM_POWER_PASSIVE[%d] is a FLAG (=%d), not a rank -- "
+                              "using JEWEL_RANK %d from the gem itself",
+                              nSno, nRank, s_nGoldGemRank)
+                    }
+                    nRank = s_nGoldGemRank;
+                }
+                if (nRank <= nMin) {
+                    // Say WHY the rank part did nothing. A gem that is not equipped, a wrong
+                    // power SNO and an attribute carrying a flag rather than a rank all look
+                    // identical from outside. This no longer returns -- the flat multiplier
+                    // below still applies, which is the whole point of it being independent.
+                    static s32 s_snoSaid = -1;
+                    if (s_snoSaid != nSno) {
+                        s_snoSaid = nSno;
+                        PRINT("[d3hack-gold] no rank scaling: ITEM_POWER_PASSIVE[%d] reads %d, "
+                              "need > %d (gem not equipped, wrong power SNO, or that attribute "
+                              "is a flag rather than a rank -- HoarderGoldProbe prints the "
+                              "gem's own rank)",
+                              nSno, nRank, nMin)
+                    }
+                } else {
+                    int       nRankMult = 100 + (nRank - nMin) * nPct;
+                    const int nCap      = global_config.rare_cheats.hoarder_gold_max_percent;
+                    if (nRankMult > nCap)
+                        nRankMult = nCap;
+                    if (nRankMult > 100) {
+                        // Composed in int64: flat is capped at 1,000,000 and the rank cap is a
+                        // config value, so the product does not fit an int32 in the worst case.
+                        int64 nComb = (static_cast<int64>(nMult) *
+                                       static_cast<int64>(nRankMult)) / 100;
+                        if (nComb > 100000000LL)
+                            nComb = 100000000LL;  // 1,000,000x ceiling
+                        nMult = static_cast<int>(nComb);
+                    }
+                }
+            }
+
+            if (nMult <= 100)
+                return Orig(tACD, nAmount, eCurrencyType, eReason, bForceNoSound);
+
+            // Raise, never lower, and never wrap: the purse is an int64 and a rank-10000 gem
+            // with a careless percent would otherwise turn a big pickup negative.
+            int64 nOut = nAmount;
+            if (nAmount <= (INT64_MAX / static_cast<int64>(nMult)))
+                nOut = (nAmount * static_cast<int64>(nMult)) / 100;
+            else
+                nOut = INT64_MAX / 2;
+
+            static int s_nLog = 0;
+            if (s_nLog < 12) {
+                ++s_nLog;
+                PRINT("[d3hack-gold] x%d.%02d (flat %d%%, gem-rank composed) : %lld -> %lld",
+                      nMult / 100, nMult % 100, nFlat, static_cast<long long>(nAmount),
+                      static_cast<long long>(nOut))
+            }
+            return Orig(tACD, nOut, eCurrencyType, eReason, bForceNoSound);
         }
     };
 
@@ -11686,9 +13440,19 @@ namespace d3 {
             // pool-of-reflection bonus (see the note on the hook), so either being asked for
             // is reason to install it. Previously the pool bonus was unreachable whenever
             // ExperienceMultiplierHighGR was 1, because of the outer gate above.
+            // d3hack-custom: xp_ledger belongs in this condition. The ledger observes THIS
+            // hook, so gating the install on the multipliers means the instrument vanishes in
+            // exactly the run you want it for -- a baseline with every multiplier at stock.
+            // Set up on 2026-09-06 without it, and the control run produced zero ledger lines:
+            // the diagnostic was gated behind the feature it exists to measure, which is the
+            // same mistake as a feature gated behind a diagnostic, in the other direction.
+            // At stock settings the hook is a pass-through (Numerator() == 100, bonus 1x,
+            // uWant == uRaw), so installing it for the ledger changes no number.
             if (global_config.rare_cheats.xp_hook_mode > 0 &&
                 (global_config.rare_cheats.xp_gr_bonus > 1 ||
-                 global_config.rare_cheats.pool_xp_percent > 0)) {
+                 global_config.rare_cheats.pool_xp_percent > 0 ||
+                 global_config.rare_cheats.xp_ledger ||
+                 global_config.rare_cheats.paragon_xp_cost_per1000 > 0)) {
                 s_nXpHookMode = global_config.rare_cheats.xp_hook_mode;
                 HighGRExperience::InstallAtOffset(0x79FE6C);  // NOT 0x79FE40 or 0x79FE84
             }
@@ -11934,16 +13698,20 @@ namespace d3 {
                 // Install confirmation, because this pair carries the FEATURE. Silence from a
                 // hook with no install line proves nothing, and that is precisely how the
                 // WorldGenProbe trigger gate went unnoticed.
-                PRINT("[d3hack-plan] plan hooks installed at 0x816E98 / 0x816EAC "
-                      "(substitute=%d probe=%d)",
-                      global_config.rare_cheats.rift_map_substitute ? 1 : 0,
-                      global_config.rare_cheats.world_gen_probe ? 1 : 0)
+                if (global_config.rare_cheats.verbose_world_log) {
+                    PRINT("[d3hack-plan] plan hooks installed at 0x816E98 / 0x816EAC "
+                          "(substitute=%d probe=%d)",
+                          global_config.rare_cheats.rift_map_substitute ? 1 : 0,
+                          global_config.rare_cheats.world_gen_probe ? 1 : 0)
+                }
             }
             if (global_config.rare_cheats.world_gen_probe) {
                 RiftPlanAppendProbe::InstallAtOffset(0x8174AC);
                 RiftRecordInit::InstallAtOffset(0x676B68);
                 PRINT_LINE("[d3hack-wc] world-factory probe installed at 0xD956C (read-only)");
-                PRINT_LINE("[d3hack-plan] rift floor-plan probe installed at 0x8174AC (read-only)");
+                if (global_config.rare_cheats.verbose_world_log) {
+                    PRINT_LINE("[d3hack-plan] rift floor-plan probe installed at 0x8174AC (read-only)");
+                }
             }
             if (global_config.rare_cheats.power_random_probe ||
                 global_config.rare_cheats.world_gen_probe ||   // d3hack-custom: same inner RNG
@@ -11977,6 +13745,46 @@ namespace d3 {
                 PRINT("[d3hack-custom] power formula hook installed at 0x9A0900 (probe=%d)",
                       global_config.rare_cheats.power_formula_probe ? 1 : 0)
             }
+            // d3hack-custom: goblin-cache investigation. Read-only; see the note on the probes.
+            // d3hack-custom: the victim hook carries the FEATURE as well as the probe, so it
+            // installs for either. Gating a feature behind a diagnostic flag is the mistake
+            // this project keeps paying for; see the rules at the top of CLAUDE.md.
+            if (global_config.rare_cheats.goblin_cache_drop) {
+                GoblinCacheSwap::InstallAtOffset(0x88DDE0);
+                PRINT("[d3hack-gobcache] goblin cache drop ARMED: one drop per goblin becomes "
+                      "gbid %08X (hook 0x%X on the loot roll)",
+                      static_cast<u32>(global_config.rare_cheats.goblin_cache_gbid), 0x88DDE0)
+            }
+            if (global_config.rare_cheats.goblin_cache_probe ||
+                global_config.rare_cheats.goblin_cache_drop) {
+                Probe_MonsterLoot::InstallAtOffset(0x8740B0);
+            }
+            if (global_config.rare_cheats.goblin_cache_probe) {
+                Probe_LootRoll::InstallAtOffset(0x88DDE0);
+                Probe_ItemIter::InstallAtOffset(0x48C120);
+                Probe_CacheCheck::InstallAtOffset(0x89480C);
+                PRINT("[d3hack-gobcache] probes installed (lootroll 0x%X, victim 0x%X, "
+                      "itemiter 0x%X) -- ids are reported on the first hit, NOT here: "
+                      "GlobalSNOGet faults during module init", 0x88DDE0, 0x8740B0, 0x48C120)
+            }
+            // d3hack-custom: installs with the FEATURE, and with the probe on its own so a
+            // diagnostic run needs nothing else switched on. The standing rule in this file:
+            // never gate a feature behind a probe flag.
+            if (global_config.rare_cheats.hoarder_gold_probe ||
+                global_config.rare_cheats.gold_multiplier_percent > 100 ||
+                (global_config.rare_cheats.hoarder_gold_pct_per_rank > 0 &&
+                 global_config.rare_cheats.hoarder_gold_power_sno > 0)) {
+                GemRankGoldGrant::InstallAtFuncPtr(ACD_ModifyCurrencyAmount);
+                PRINT("[d3hack-gold] gold hook installed on ACD_ModifyCurrencyAmount "
+                      "(flat=%d%% power=%d minRank=%d +%d%%/rank cap=%d%% currency=%d probe=%d)",
+                      global_config.rare_cheats.gold_multiplier_percent,
+                      global_config.rare_cheats.hoarder_gold_power_sno,
+                      global_config.rare_cheats.hoarder_gold_min_rank,
+                      global_config.rare_cheats.hoarder_gold_pct_per_rank,
+                      global_config.rare_cheats.hoarder_gold_max_percent,
+                      global_config.rare_cheats.hoarder_gold_currency,
+                      global_config.rare_cheats.hoarder_gold_probe ? 1 : 0)
+            }
             if (global_config.rare_cheats.pool_grant_hook) {
                 pools::Load();
                 PoolGranted::InstallAtOffset(0x7A0BA0);  // d3hack-custom
@@ -12000,6 +13808,27 @@ namespace d3 {
                 global_config.rare_cheats.infinite_shrine_buffs ||
                 global_config.rare_cheats.rama_any_item) {
                 AttrGetInt::InstallAtOffset(0x46FAB0);  // d3hack-custom
+
+                // d3hack-custom: cosmetic pet knobs. Installs on its OWN flags. Skipped when
+                // DamageBonusProbe has claimed the same address -- two trampolines on one
+                // function is the bug this file keeps warning about -- and it SAYS so rather
+                // than silently doing nothing.
+                if ((global_config.rare_cheats.pet_speed_percent > 100 ||
+                     global_config.rare_cheats.pet_pickup_radius > 0.0f ||
+                     global_config.rare_cheats.pet_probe) &&
+                    ACD_AttributesGetFloat != nullptr) {
+                    if (global_config.rare_cheats.damage_bonus_probe) {
+                        PRINT_LINE("[d3hack-pet] NOT installed: DamageBonusProbe already owns "
+                                   "ACD_AttributesGetFloat. Turn that probe off to use the pet knobs.");
+                    } else {
+                        AttrGetFloatPet::InstallAtFuncPtr(ACD_AttributesGetFloat);
+                        PRINT("[d3hack-pet] pet hooks installed on ACD_AttributesGetFloat "
+                              "(speed=%d%% radius=%d probe=%d)",
+                              global_config.rare_cheats.pet_speed_percent,
+                              static_cast<int>(global_config.rare_cheats.pet_pickup_radius),
+                              global_config.rare_cheats.pet_probe ? 1 : 0)
+                    }
+                }
             }
             if (global_config.rare_cheats.rama_any_item) {
                 CanAddSockets::InstallAtOffset(0x4F6C90);  // d3hack-custom: carries the -1 override
@@ -12026,16 +13855,22 @@ namespace d3 {
             // already cost this project several sessions.
             if (global_config.rare_cheats.xp_hook_mode > 0 &&
                 (global_config.rare_cheats.xp_gr_bonus > 1 ||
-                 global_config.rare_cheats.pool_xp_percent > 0)) {
+                 global_config.rare_cheats.pool_xp_percent > 0 ||
+                 global_config.rare_cheats.xp_ledger ||
+                 global_config.rare_cheats.paragon_xp_cost_per1000 > 0)) {
                 PRINT("[d3hack-custom] xp x%d from GR %d, pools +%d%% each, <=%d levels per grant "
-                      "(hook 0x%X)",
+                      "(hook 0x%X) ledger=%d costscale=+%d%%/1000 from=%d",
                       global_config.rare_cheats.xp_gr_bonus, global_config.rare_cheats.xp_gr_bonus_min_gr,
                       global_config.rare_cheats.pool_xp_percent,
-                      global_config.rare_cheats.pool_xp_levels_per_grant, 0x79FE6C)
+                      global_config.rare_cheats.pool_xp_levels_per_grant, 0x79FE6C,
+                      global_config.rare_cheats.xp_ledger ? 1 : 0,
+                      global_config.rare_cheats.paragon_xp_cost_per1000,
+                      global_config.rare_cheats.paragon_xp_cost_from)
             } else {
                 PRINT_LINE("[d3hack-custom] experience hook NOT installed "
-                           "(needs ExperienceHookMode > 0 and either "
-                           "ExperienceMultiplierHighGR > 1 or PoolOfReflectionXpPercent > 0)");
+                           "(needs ExperienceHookMode > 0 and one of "
+                           "ExperienceMultiplierHighGR > 1, PoolOfReflectionXpPercent > 0, "
+                           "XpLedger = true, ParagonXpCostPer1000 > 0)");
             }
         }
 
@@ -12108,11 +13943,25 @@ namespace d3 {
         const bool bEliteProbe =
             global_config.rare_cheats.active && global_config.rare_cheats.elite_event_probe;
 
+        // d3hack-custom: the gem-name binding for the gold feature rides these same setters,
+        // so it installs with the FEATURE and not only with its probe.
+        const bool bGoldGem = global_config.rare_cheats.active &&
+                              (global_config.rare_cheats.hoarder_gold_probe ||
+                               global_config.rare_cheats.hoarder_gold_pct_per_rank > 0);
+
         if (global_config.rare_cheats.active && !bEliteProbe && !bCombatFeed &&
             (global_config.rare_cheats.camera_trap || global_config.rare_cheats.camera_observer_scan ||
-             global_config.rare_cheats.shrine_duration_probe)) {
+             global_config.rare_cheats.shrine_duration_probe || bGoldGem)) {
             EliteEventProbe::InstallAtFuncPtr(ACD_AttributesSetInt);
             PRINT("[d3hack-own] ACD hook installed for the camera probes only%s", "")
+        }
+
+        // The float setter is already taken by the elite probe when that is on; installing it
+        // twice at one address is not something this hook library survives.
+        if (bGoldGem && !bEliteProbe) {
+            EliteEventProbeFloat::InstallAtFuncPtr(ACD_AttributesSetFloat);
+            PRINT("[d3hack-gold] gem-name watch installed on both attribute setters (probe=%d)",
+                  global_config.rare_cheats.hoarder_gold_probe ? 1 : 0)
         }
 
         // d3hack-custom: the combat log's hooks, plus the elite-event DIAGNOSTIC on top.
@@ -12161,6 +14010,24 @@ namespace d3 {
             PRINT("[d3hack-custom] paragon category pool scaled x%d at 0x527870 "
                   "(non-Core capacity 200 -> %d)",
                   s_nParagonLimitFactor, 200 * s_nParagonLimitFactor)
+        }
+
+        // d3hack-custom: installs with the FEATURE (rows > 6), not with the probe.
+        if (global_config.loot_modifiers.active && global_config.loot_modifiers.BackpackRows > 6) {
+            BackpackCellUsable::InstallAtOffset(0x488EC0);
+            PRINT("[d3hack-bpgrid] cell-usable override is LIVE (0x488EC0), rows=%d",
+                  global_config.loot_modifiers.BackpackRows)
+        }
+
+        // d3hack-custom: own switch, default off, and it is the ONLY thing this flag
+        // installs -- see the note on the hook. 0x488620 is a verified function entry
+        // (proper `sub sp, sp, #0x90` prologue, boundary at 0x48861C).
+        // d3hack-custom: install on FEATURE || PROBE. The probe may only raise logging
+        // volume -- it must never be what makes the feature work.
+        if ((global_config.loot_modifiers.active && global_config.loot_modifiers.BackpackRows > 6) ||
+            global_config.rare_cheats.backpack_grid_probe) {
+            BackpackGridWalk::InstallAtOffset(0x488620);
+            PRINT_LINE("[d3hack-bpgrid] backpack grid walk probe is LIVE (0x488620)");
         }
 
         if (global_config.loot_modifiers.active) {

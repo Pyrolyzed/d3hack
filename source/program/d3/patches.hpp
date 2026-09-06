@@ -25,6 +25,7 @@ namespace d3 {
     void UpdateDynamicSeasonalForSpawn(const GameParams *tParams);
     void PatchDynamicEvents();
     void PatchSeasonalItemGates();  // d3hack-custom
+    void PatchBackpackRows();  // d3hack-custom
     void PatchInfiniteMp(bool enabled);
     void PatchBase();
     void ExtendTieredRiftTable();

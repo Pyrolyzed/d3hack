@@ -44,6 +44,7 @@ FUNC_PTR(SItemCrafting_LearnRecipe,               void (*)(const ACDID idACDPlay
 FUNC_PTR(sCrafterOnLevelUp,                       void (*)(const Player *tPlayer, CrafterType eType, const BOOL fChangedRank, const BOOL fSendToClient));
 FUNC_PTR(LootRollForAncientLegendary,             void (*)(LootSpecifier *tSpecifier, const ACDID idACDLooter));
 FUNC_PTR(LootItemIsLegendary,                     BOOL (*)(GBID gbidItem));  // d3hack-custom
+FUNC_PTR(LootItemIsEthereal,                      BOOL (*)(GBID gbidItem));  // d3hack-custom
 FUNC_PTR(GlobalSNOGet,                             SNO (*)(const SNO eGlobalSNO));
 FUNC_PTR(CameraSetZoomValue,                      void (*)(int nPlayer, float flZoom, float flBlendSeconds));  // d3hack-custom
 FUNC_PTR(CameraApplyObserverByName,               void (*)(int nView, const char *szObserver, int nFlags));  // d3hack-custom

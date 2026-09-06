@@ -447,24 +447,129 @@ namespace d3 {
     };
 
     // d3hack-custom: fires ON the layout-B assert path (0x67B3C0), where x0 is still the
-    // descriptor and x8 the value struct. Reports exactly which values failed the check.
+    // descriptor.
+    //
+    // x8 is NOT the value struct at this point: 0x67B394 is `subs w8, w9, w10`, so by the time
+    // the branch to 0x67B3C0 is taken x8 holds (value - min) and the entry pointer is gone.
+    // The value survives in w9, which is what this reads now. The earlier version dereferenced
+    // x8 + 0xC and could only ever have printed "bad ptrs".
+    //
+    // Superseded in practice by AttribSerializeGuardB, which clamps before the branch is ever
+    // taken; this stays as the last-ditch reporter if the guard is ever not installed.
     HOOK_DEFINE_INLINE(Diag_BitfieldAssertB) {
         static void Callback(exl::hook::InlineCtx *ctx) {
             static int s_n = 0;
             if (s_n >= 12) return;
             ++s_n;
             const auto d = static_cast<uintptr_t>(ctx->X[0]);
-            const auto v = static_cast<uintptr_t>(ctx->X[8]);
-            if (d < 0x10000u || v < 0x10000u) {
-                PRINT("[d3hack-diag] assertB: bad ptrs x0=%p x8=%p", reinterpret_cast<void*>(d), reinterpret_cast<void*>(v))
+            if (d < 0x10000u) {
+                PRINT("[d3hack-diag] assertB: bad descriptor x0=%p", reinterpret_cast<void*>(d))
                 return;
             }
             PRINT("[d3hack-diag] assertB: value=%d min=%d max=%d bits=%d desc=%p",
-                  *reinterpret_cast<const s32*>(v + 0x0C),
+                  static_cast<s32>(static_cast<u32>(ctx->X[9])),
                   *reinterpret_cast<const s32*>(d + 0x18),
                   *reinterpret_cast<const s32*>(d + 0x1C),
                   *reinterpret_cast<const s32*>(d + 0x20),
                   reinterpret_cast<void*>(d))
+        }
+    };
+
+    // d3hack-custom: STOP the layout-B attribute serializer from killing the process.
+    //
+    // 0x67B360 serializes ONE attribute into an update message:
+    //
+    //     0067B360  x8 = entry (x2); x9/x10 = writer bounds; w2 = desc->bits   (room check)
+    //     0067B390  ldr  w9, [x8, #0xc]     ; the value
+    //     0067B394  subs w8, w9, w10        ; w10 = desc->min -- and this eats the entry ptr
+    //     0067B398  b.lt 0x67B3C0           ; value < min -> assert
+    //     0067B3A4  b.gt 0x67B3C0           ; value > max -> assert
+    //     0067B3B0  bl   0xA3C100           ; else write (value - min) in desc->bits bits
+    //     0067B3C0  ...  bl 0xA2C340        ; 0xE7FFDEFE, undefined instruction: process dies
+    //
+    // The field goes out as (value - min) in a fixed bit width, so a value outside the
+    // declared range is literally unrepresentable and the game aborts rather than truncate.
+    // Every cap this mod raises -- paragon level, gem rank, per-stat limit, category pools --
+    // can push some attribute past a range that was declared for the STOCK caps, and the
+    // failure mode is a hard process abort with no message of any kind. That is what ended the
+    // 2026-09-05 session 1h28m into a rift.
+    //
+    // Clamping the outgoing copy is strictly better than dying, and it is only ever reached
+    // where the process was otherwise guaranteed to abort. The entry belongs to the message
+    // being built (0x71C800 walks it, 16 bytes per entry: param@+0, id@+8, value@+0xC), not to
+    // the live attribute, so the cost is one wrong number on the wire in one message -- against
+    // losing the session and everything since the last save.
+    //
+    // It is NOT the real fix for whatever lands here. The real fix is to widen that attribute's
+    // declared range at construction, the way Ctor_WidenParagonField does, which is why this
+    // NAMES the offender: descriptors are 0x40 bytes with the name pointer at +0x28 (see
+    // re/attrnames.py), so the log says which attribute instead of leaving a silent clamp.
+    static auto SerializerDescName(uintptr_t pDesc) -> const char * {
+        const auto p = *reinterpret_cast<const uintptr_t *>(pDesc + 0x28);
+        if (p < 0x8000000u)
+            return "?";
+        const auto *s = reinterpret_cast<const char *>(p);
+        for (int i = 0; i < 64; ++i) {
+            if (s[i] == '\0')
+                return (i > 0) ? s : "?";
+            if (s[i] < 0x20 || s[i] > 0x7E)
+                return "?";
+        }
+        return "?";
+    }
+
+    static void ReportSerializerClamp(uintptr_t pDesc, uintptr_t pEntry, s32 value, s32 clamped,
+                                      s32 vMin, s32 vMax) {
+        // Rate limited per descriptor: an attribute that is out of range once is out of range
+        // in every update message that carries it, which is tens of times a second.
+        static uintptr_t s_arSeen[16] = {};
+        static u32       s_arHits[16] = {};
+        static int       s_nSeen      = 0;
+
+        int idx = -1;
+        for (int i = 0; i < s_nSeen; ++i) {
+            if (s_arSeen[i] == pDesc) {
+                idx = i;
+                break;
+            }
+        }
+        if (idx < 0) {
+            if (s_nSeen >= 16)
+                return;  // 17th distinct offender: the first 16 have said enough
+            idx           = s_nSeen++;
+            s_arSeen[idx] = pDesc;
+        }
+        const u32 nHits = ++s_arHits[idx];
+        if (nHits != 1 && (nHits & 0xFFFu) != 0)
+            return;
+
+        PRINT("[d3hack-attrclamp] \"%s\" id=%u param=0x%08X value=%d -> %d "
+              "(declared %d..%d, %d bits) hits=%u desc=%p -- WOULD HAVE ABORTED",
+              SerializerDescName(pDesc),
+              *reinterpret_cast<const u32 *>(pEntry + 0x08),
+              *reinterpret_cast<const u32 *>(pEntry + 0x00),
+              value, clamped, vMin, vMax,
+              *reinterpret_cast<const s32 *>(pDesc + 0x20),
+              nHits, reinterpret_cast<void *>(pDesc))
+    }
+
+    HOOK_DEFINE_TRAMPOLINE(AttribSerializeGuardB) {
+        // x0 = descriptor, x1 = bit writer, x2 = message entry.
+        static auto Callback(uintptr_t pDesc, uintptr_t pWriter, uintptr_t pEntry) -> s32 {
+            if (pDesc >= 0x8000000u && pEntry >= 0x8000000u) {
+                const s32 vMin = *reinterpret_cast<const s32 *>(pDesc + 0x18);
+                const s32 vMax = *reinterpret_cast<const s32 *>(pDesc + 0x1C);
+                if (vMin <= vMax) {
+                    auto     *pVal  = reinterpret_cast<s32 *>(pEntry + 0x0C);
+                    const s32 value = *pVal;
+                    if (value < vMin || value > vMax) {
+                        const s32 clamped = (value < vMin) ? vMin : vMax;
+                        *pVal             = clamped;
+                        ReportSerializerClamp(pDesc, pEntry, value, clamped, vMin, vMax);
+                    }
+                }
+            }
+            return Orig(pDesc, pWriter, pEntry);
         }
     };
 
@@ -1382,6 +1487,18 @@ namespace d3 {
             Ctor_WidenParagonField::InstallAtOffset(static_cast<ptrdiff_t>(off));
         PRINT("[d3hack-custom] paragon field widened at construction (%d ctor sites): declared "
               "max 0x7FFFFFFF, width derived as 31 bits", 4)
+    }
+
+    // d3hack-custom: the attribute-serializer range guard, installed unconditionally.
+    //
+    // Not a diagnostic, and not tied to one cheat: ANY raised cap can push ANY attribute past a
+    // range declared for the stock caps, and the stock response is to abort the process. So it
+    // is registered on its own and gated on nothing -- no logging switch can take it away,
+    // which is the exact trap the ParagonFieldWidening note above describes.
+    inline void SetupSerializerRangeGuard() {
+        AttribSerializeGuardB::InstallAtOffset(0x67B360);
+        PRINT("[d3hack-attrclamp] attribute serializer range guard installed at 0x%X -- "
+              "out-of-range values are clamped and named instead of aborting", 0x67B360)
     }
 
     inline void SetupDebuggingHooks() {

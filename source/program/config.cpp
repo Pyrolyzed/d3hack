@@ -1,4 +1,5 @@
 #include "program/config.hpp"
+#include "program/d3/resolution_util.hpp"
 #include "d3/setting.hpp"
 #include "d3/resolution_util.hpp"
 #include "lib/diag/assert.hpp"
@@ -491,6 +492,8 @@ namespace {
             t.insert("ViewDollyZMin", static_cast<double>(config.rare_cheats.view_dolly_zmin));
             t.insert("ViewDollyZMax", static_cast<double>(config.rare_cheats.view_dolly_zmax));
             t.insert("PowerFormulaProbe", config.rare_cheats.power_formula_probe);
+            t.insert("BackpackGridProbe", config.rare_cheats.backpack_grid_probe);
+            t.insert("BackpackGridProbeCells", static_cast<s64>(config.rare_cheats.backpack_grid_probe_cells));
             t.insert("PowerRandomProbe", config.rare_cheats.power_random_probe);
             t.insert("WorldGenProbe", config.rare_cheats.world_gen_probe);
             t.insert("PowerRandomBiasSno", config.rare_cheats.power_random_bias_sno);
@@ -500,6 +503,17 @@ namespace {
             t.insert("PowerFormulaScaleIndex", config.rare_cheats.power_formula_index);
             t.insert("PowerFormulaScaleIndexList", config.rare_cheats.power_formula_index_list);
             t.insert("PowerFormulaScalePercent", config.rare_cheats.power_formula_percent);
+            t.insert("HoarderGoldProbe", config.rare_cheats.hoarder_gold_probe);
+            t.insert("HoarderGoldPowerSno", config.rare_cheats.hoarder_gold_power_sno);
+            t.insert("HoarderGoldMinRank", config.rare_cheats.hoarder_gold_min_rank);
+            t.insert("HoarderGoldPercentPerRank", config.rare_cheats.hoarder_gold_pct_per_rank);
+            t.insert("HoarderGoldMaxPercent", config.rare_cheats.hoarder_gold_max_percent);
+            t.insert("PetSpeedPercent", config.rare_cheats.pet_speed_percent);
+            t.insert("PetPickupRadius", config.rare_cheats.pet_pickup_radius);
+            t.insert("PetProbe", config.rare_cheats.pet_probe);
+            t.insert("GoldMultiplierPercent", config.rare_cheats.gold_multiplier_percent);
+            t.insert("HoarderGoldCurrency", config.rare_cheats.hoarder_gold_currency);
+            t.insert("HoarderGoldGemName", config.rare_cheats.hoarder_gold_gem_name);
             t.insert("HealthWellsAsPoolsOfReflection", config.rare_cheats.wells_as_pools);
             t.insert("WellSpawnProbe", config.rare_cheats.well_spawn_probe);
             t.insert("GreaterRiftDensityMultiplier", config.rare_cheats.gr_density_multiplier);
@@ -519,6 +533,7 @@ namespace {
             t.insert("SocketAffixAnySlot", config.rare_cheats.socket_affix_any_slot);
             t.insert("SocketAffixSuppress", config.rare_cheats.socket_affix_suppress);
             t.insert("SetBonusTierShift", config.rare_cheats.set_bonus_tier_shift);
+            t.insert("SetBonusPieceFloor", config.rare_cheats.set_bonus_piece_floor);
             t.insert("SetBonusDump", config.rare_cheats.set_bonus_dump);
             t.insert("RamaladniAnyItem", config.rare_cheats.rama_any_item);
             t.insert("FreeSocketsOnEveryItem", config.rare_cheats.free_sockets);
@@ -533,6 +548,13 @@ namespace {
             t.insert("ShrineDurationProbe", config.rare_cheats.shrine_duration_probe);
             t.insert("CameraFieldDump", config.rare_cheats.camera_field_dump);
             t.insert("PartialCurrencyPickup", config.rare_cheats.partial_currency_pickup);
+            t.insert("ParagonXpCostFrom", config.rare_cheats.paragon_xp_cost_from);        // d3hack-custom
+            t.insert("ParagonXpCostPer1000", config.rare_cheats.paragon_xp_cost_per1000);  // d3hack-custom
+            t.insert("GoblinCacheDrop", config.rare_cheats.goblin_cache_drop);  // d3hack-custom
+            t.insert("GoblinCacheGbid", static_cast<s64>(config.rare_cheats.goblin_cache_gbid));  // d3hack-custom
+            t.insert("GoblinCacheProbe", config.rare_cheats.goblin_cache_probe);  // d3hack-custom
+            t.insert("VerboseWorldLog", config.rare_cheats.verbose_world_log);  // d3hack-custom
+            t.insert("XpLedger", config.rare_cheats.xp_ledger);  // d3hack-custom
             t.insert("XpScaleRested", config.rare_cheats.xp_scale_rested);
             t.insert("ExperienceHookMode", config.rare_cheats.xp_hook_mode);
             t.insert("PoolOfReflectionTouchHook", config.rare_cheats.pool_touch_hook);
@@ -567,6 +589,8 @@ namespace {
             t.insert("AncientMinGRLevel", static_cast<s64>(config.loot_modifiers.AncientMinGRLevel));
             t.insert("PrimalMinGRLevel", static_cast<s64>(config.loot_modifiers.PrimalMinGRLevel));
             t.insert("PrimalGuaranteedCount", static_cast<s64>(config.loot_modifiers.PrimalGuaranteedCount));
+            t.insert("EtherealAlwaysPrimal", config.loot_modifiers.EtherealAlwaysPrimal);
+            t.insert("BackpackRows", static_cast<s64>(config.loot_modifiers.BackpackRows));
             t.insert("AncientRank", std::string(AncientRankCanonical(config.loot_modifiers.AncientRankValue, config.loot_modifiers.AncientRank)));
             root.insert("loot_modifiers", std::move(t));
         }
@@ -736,6 +760,8 @@ void PatchConfig::ApplyTable(const toml::table &table) {
         rare_cheats.view_dolly_zmin          = static_cast<float>(ReadDouble(*section, {"ViewDollyZMin"}, static_cast<double>(rare_cheats.view_dolly_zmin), -5000.0, 0.0));
         rare_cheats.view_dolly_zmax          = static_cast<float>(ReadDouble(*section, {"ViewDollyZMax"}, static_cast<double>(rare_cheats.view_dolly_zmax), -5000.0, 0.0));
         rare_cheats.power_formula_probe     = ReadBool(*section, {"PowerFormulaProbe"}, rare_cheats.power_formula_probe);
+        rare_cheats.backpack_grid_probe     = ReadBool(*section, {"BackpackGridProbe"}, rare_cheats.backpack_grid_probe);
+        rare_cheats.backpack_grid_probe_cells = ReadI32(*section, {"BackpackGridProbeCells"}, rare_cheats.backpack_grid_probe_cells, 0, 5000);
         rare_cheats.power_random_probe      = ReadBool(*section, {"PowerRandomProbe"}, rare_cheats.power_random_probe);
         rare_cheats.world_gen_probe         = ReadBool(*section, {"WorldGenProbe"}, rare_cheats.world_gen_probe);
         rare_cheats.power_random_bias_sno   = ReadI32(*section, {"PowerRandomBiasSno"}, rare_cheats.power_random_bias_sno, 0, 2000000000);
@@ -745,6 +771,17 @@ void PatchConfig::ApplyTable(const toml::table &table) {
         rare_cheats.power_formula_index     = ReadI32(*section, {"PowerFormulaScaleIndex"}, rare_cheats.power_formula_index, -1, 63);
         rare_cheats.power_formula_index_list = ReadString(*section, {"PowerFormulaScaleIndexList"}, rare_cheats.power_formula_index_list);
         rare_cheats.power_formula_percent   = ReadI32(*section, {"PowerFormulaScalePercent"}, rare_cheats.power_formula_percent, 1, 100000);
+        rare_cheats.hoarder_gold_probe      = ReadBool(*section, {"HoarderGoldProbe"}, rare_cheats.hoarder_gold_probe);
+        rare_cheats.hoarder_gold_power_sno  = ReadI32(*section, {"HoarderGoldPowerSno"}, rare_cheats.hoarder_gold_power_sno, 0, 2000000000);
+        rare_cheats.hoarder_gold_min_rank   = ReadI32(*section, {"HoarderGoldMinRank"}, rare_cheats.hoarder_gold_min_rank, 0, 100000);
+        rare_cheats.hoarder_gold_pct_per_rank = ReadI32(*section, {"HoarderGoldPercentPerRank"}, rare_cheats.hoarder_gold_pct_per_rank, 0, 100000);
+        rare_cheats.hoarder_gold_max_percent = ReadI32(*section, {"HoarderGoldMaxPercent"}, rare_cheats.hoarder_gold_max_percent, 100, 100000000);
+        rare_cheats.pet_speed_percent       = ReadI32(*section, {"PetSpeedPercent"}, rare_cheats.pet_speed_percent, 100, 10000);
+        rare_cheats.pet_pickup_radius       = static_cast<float>(ReadDouble(*section, {"PetPickupRadius"}, rare_cheats.pet_pickup_radius, 0.0, 100000.0));
+        rare_cheats.pet_probe               = ReadBool(*section, {"PetProbe"}, rare_cheats.pet_probe);
+        rare_cheats.gold_multiplier_percent = ReadI32(*section, {"GoldMultiplierPercent"}, rare_cheats.gold_multiplier_percent, 100, 1000000);
+        rare_cheats.hoarder_gold_currency   = ReadI32(*section, {"HoarderGoldCurrency"}, rare_cheats.hoarder_gold_currency, 0, 64);
+        rare_cheats.hoarder_gold_gem_name   = ReadString(*section, {"HoarderGoldGemName"}, rare_cheats.hoarder_gold_gem_name);
         rare_cheats.wells_as_pools          = ReadBool(*section, {"HealthWellsAsPoolsOfReflection"}, rare_cheats.wells_as_pools);
         rare_cheats.well_spawn_probe        = ReadBool(*section, {"WellSpawnProbe"}, rare_cheats.well_spawn_probe);
         // Ceiling raised 20 -> 1000. The old one silently clamped anything above it, so a
@@ -766,6 +803,7 @@ void PatchConfig::ApplyTable(const toml::table &table) {
         rare_cheats.socket_affix_any_slot   = ReadBool(*section, {"SocketAffixAnySlot"}, rare_cheats.socket_affix_any_slot);
         rare_cheats.socket_affix_suppress   = ReadBool(*section, {"SocketAffixSuppress"}, rare_cheats.socket_affix_suppress);
         rare_cheats.set_bonus_tier_shift    = ReadBool(*section, {"SetBonusTierShift"}, rare_cheats.set_bonus_tier_shift);
+        rare_cheats.set_bonus_piece_floor   = ReadI32(*section, {"SetBonusPieceFloor"}, rare_cheats.set_bonus_piece_floor, 0, 12);
         rare_cheats.set_bonus_dump          = ReadBool(*section, {"SetBonusDump"}, rare_cheats.set_bonus_dump);
         rare_cheats.rama_any_item           = ReadBool(*section, {"RamaladniAnyItem"}, rare_cheats.rama_any_item);
         rare_cheats.free_sockets            = ReadI32(*section, {"FreeSocketsOnEveryItem"}, rare_cheats.free_sockets, 0, 3);
@@ -780,6 +818,13 @@ void PatchConfig::ApplyTable(const toml::table &table) {
         rare_cheats.shrine_duration_probe   = ReadBool(*section, {"ShrineDurationProbe"}, rare_cheats.shrine_duration_probe);
         rare_cheats.camera_field_dump        = ReadBool(*section, {"CameraFieldDump"}, rare_cheats.camera_field_dump);
         rare_cheats.partial_currency_pickup  = ReadBool(*section, {"PartialCurrencyPickup"}, rare_cheats.partial_currency_pickup);
+        rare_cheats.paragon_xp_cost_from     = ReadI32(*section, {"ParagonXpCostFrom"}, rare_cheats.paragon_xp_cost_from, 0, 2000000000);  // d3hack-custom
+        rare_cheats.paragon_xp_cost_per1000  = ReadI32(*section, {"ParagonXpCostPer1000"}, rare_cheats.paragon_xp_cost_per1000, 0, 1000000);  // d3hack-custom
+        rare_cheats.goblin_cache_drop        = ReadBool(*section, {"GoblinCacheDrop"}, rare_cheats.goblin_cache_drop);  // d3hack-custom
+        rare_cheats.goblin_cache_gbid        = ReadU32(*section, {"GoblinCacheGbid"}, rare_cheats.goblin_cache_gbid, 0u, 0xFFFFFFFFu);  // d3hack-custom
+        rare_cheats.goblin_cache_probe       = ReadBool(*section, {"GoblinCacheProbe"}, rare_cheats.goblin_cache_probe);  // d3hack-custom
+        rare_cheats.verbose_world_log        = ReadBool(*section, {"VerboseWorldLog"}, rare_cheats.verbose_world_log);  // d3hack-custom
+        rare_cheats.xp_ledger                = ReadBool(*section, {"XpLedger"}, rare_cheats.xp_ledger);  // d3hack-custom
         rare_cheats.xp_scale_rested          = ReadBool(*section, {"XpScaleRested"}, rare_cheats.xp_scale_rested);
         rare_cheats.xp_hook_mode            = ReadI32(*section, {"ExperienceHookMode"}, rare_cheats.xp_hook_mode, 0, 3);
         rare_cheats.pool_touch_hook         = ReadBool(*section, {"PoolOfReflectionTouchHook"}, rare_cheats.pool_touch_hook);
@@ -810,6 +855,8 @@ void PatchConfig::ApplyTable(const toml::table &table) {
         loot_modifiers.AncientMinGRLevel         = ReadI32(*section, {"AncientMinGRLevel"}, loot_modifiers.AncientMinGRLevel, 0, 5000);
         loot_modifiers.PrimalMinGRLevel          = ReadI32(*section, {"PrimalMinGRLevel"}, loot_modifiers.PrimalMinGRLevel, 0, 5000);
         loot_modifiers.PrimalGuaranteedCount     = ReadI32(*section, {"PrimalGuaranteedCount"}, loot_modifiers.PrimalGuaranteedCount, 0, 100);
+        loot_modifiers.EtherealAlwaysPrimal      = ReadBool(*section, {"EtherealAlwaysPrimal", "EtherealsAlwaysPrimal"}, loot_modifiers.EtherealAlwaysPrimal);
+        loot_modifiers.BackpackRows              = ReadI32(*section, {"BackpackRows", "BackpackHeight"}, loot_modifiers.BackpackRows, 6, 500);
         loot_modifiers.AncientRank               = ReadString(*section, {"AncientRank"}, loot_modifiers.AncientRank);
         loot_modifiers.AncientRankValue          = AncientRankToValue(loot_modifiers.AncientRank, loot_modifiers.AncientRankValue);
         loot_modifiers.AncientRank               = AncientRankCanonical(loot_modifiers.AncientRankValue, loot_modifiers.AncientRank);
@@ -829,6 +876,7 @@ void LoadPatchConfig() {
         PRINT("Loaded config: %s", path);
         global_config.initialized   = true;
         global_config.defaults_only = false;
+        d3::ApplyResolutionHackBudget();
         if (!d3::g_rt_scale_initialized) {
             d3::g_rt_scale             = global_config.resolution_hack.HandheldScaleFraction();
             d3::g_rt_scale_initialized = true;
@@ -840,6 +888,7 @@ void LoadPatchConfig() {
     global_config.initialized   = true;
     global_config.defaults_only = true;
     PRINT("Config not found; using built-in defaults%s", ".");
+    d3::ApplyResolutionHackBudget();
     if (!d3::g_rt_scale_initialized) {
         d3::g_rt_scale             = global_config.resolution_hack.HandheldScaleFraction();
         d3::g_rt_scale_initialized = true;

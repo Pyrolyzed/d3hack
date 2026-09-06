@@ -107,6 +107,20 @@ def main():
         for f in glob.glob(os.path.join(SRC, "examples", "config", "d3hack-nx", "rift_data", "*")):
             shutil.copy2(f, os.path.join(riftdir, os.path.basename(f)))
 
+        # d3hack-custom: the LEARNED rift tables. v3.14 shipped these and this script had
+        # silently stopped -- a release without them is a release where map bans and
+        # preferences have no float cache to substitute from, so the feature is a no-op for
+        # everyone except the machine that built it. They live beside the live config, not in
+        # examples/, because they are accumulated at runtime.
+        cfgsrc = os.path.dirname(args.config)
+        for name in ("rift-maps.txt", "rift-map-gr-floats.txt", "rift-map-floats.txt"):
+            src_f = os.path.join(cfgsrc, name)
+            if os.path.exists(src_f):
+                shutil.copy2(src_f, os.path.join(cfgdir, name))
+                print("  + %s" % name)
+            else:
+                print("  ! MISSING %s -- map substitution will have no cache" % name)
+
         if args.readme:
             shutil.copy2(args.readme, os.path.join(stage, "README.txt"))
         else:

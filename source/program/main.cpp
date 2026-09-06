@@ -11,6 +11,7 @@
 #include "nn/fs/fs_mount.hpp"
 #include "d3/_util.hpp"
 #include "d3/patches.hpp"
+#include "d3/resolution_util.hpp"
 #include "program/config.hpp"
 #include "d3/hooks/util.hpp"
 #include "d3/hooks/resolution.hpp"
@@ -49,6 +50,7 @@ namespace d3 {
         [[gnu::used]] static void (*const k_emit_setup_resolution)()    = &SetupResolutionHooks;
         [[gnu::used]] static void (*const k_emit_setup_debugging)()     = &SetupDebuggingHooks;
         [[gnu::used]] static void (*const k_emit_setup_paragon_field)() = &SetupParagonFieldWidening;
+        [[gnu::used]] static void (*const k_emit_setup_attr_guard)()    = &SetupSerializerRangeGuard;
         [[gnu::used]] static void (*const k_emit_setup_season_events)() = &SetupSeasonEventHooks;
         [[gnu::used]] static void (*const k_emit_setup_lobby)()         = &SetupLobbyHooks;
 
@@ -145,13 +147,15 @@ namespace d3 {
             g_ptGCData                      = _this;
             const bool has_game_is_seasonal = (GameIsSeasonal != nullptr);
             const bool game_is_seasonal     = has_game_is_seasonal ? GameIsSeasonal() : false;
-            PRINT(
-                "[seasonal_gate] post_init conn=%x flags=0x%x game_is_seasonal=%d fn=%d",
-                (tParams != nullptr) ? tParams->idGameConnection : static_cast<uint32>(0xFFFFFFFFu),
-                (tParams != nullptr) ? tParams->dwCreationFlags : 0u,
-                game_is_seasonal ? 1 : 0,
-                has_game_is_seasonal ? 1 : 0
-            )
+            if (global_config.rare_cheats.verbose_world_log) {
+                PRINT(
+                    "[seasonal_gate] post_init conn=%x flags=0x%x game_is_seasonal=%d fn=%d",
+                    (tParams != nullptr) ? tParams->idGameConnection : static_cast<uint32>(0xFFFFFFFFu),
+                    (tParams != nullptr) ? tParams->dwCreationFlags : 0u,
+                    game_is_seasonal ? 1 : 0,
+                    has_game_is_seasonal ? 1 : 0
+                )
+            }
             // PRINT_EXPR("%x", self->nNumPlayers)
             // PRINT_EXPR("%x", self->eDifficultyLevel)
             // PRINT_EXPR("%x", tParams->idGameConnection)
@@ -209,14 +213,18 @@ namespace d3 {
                 constexpr uintptr_t kSeasonCreatedOffset = 0x1C;  // 2.7.6 SetGameParamsForHero: STR W8,[X19,#0x1C]
                 const u32           season_created       = *reinterpret_cast<const u32 *>(params_addr + kSeasonCreatedOffset);
                 g_last_hero_season_created               = season_created;
-                PRINT(
-                    "[seasonal_debug] set_game_params_for_hero season_created=%u params=0x%lx",
-                    season_created,
-                    params_addr
-                );
+                if (global_config.rare_cheats.verbose_world_log) {
+                    PRINT(
+                        "[seasonal_debug] set_game_params_for_hero season_created=%u params=0x%lx",
+                        season_created,
+                        params_addr
+                    );
+                }
             } else {
                 g_last_hero_season_created = 0u;
-                PRINT_LINE("[seasonal_debug] set_game_params_for_hero params=null");
+                if (global_config.rare_cheats.verbose_world_log) {
+                    PRINT_LINE("[seasonal_debug] set_game_params_for_hero params=null");
+                }
             }
         }
     };
@@ -240,17 +248,24 @@ namespace d3 {
             g_idGameConnection           = ServerGetOnlyGameConnection();
             auto *ptPrimaryForConnection = GetPrimaryPlayerForGameConnection(g_idGameConnection);
             PRINT("NEW sInitializeWorld! (SGame: %x | Connection: %x | Primary for connection: %p) %s %s", sGameCurID, g_idGameConnection, ptPrimaryForConnection, ptSGameGlobals->uszCreatorAccountName, ptSGameGlobals->uszCreatorHeroName);
-            PRINT(
-                "[seasonal_debug] current_hero_season_created=%u primary=%p conn=%x",
-                g_last_hero_season_created,
-                ptPrimaryForConnection,
-                g_idGameConnection
-            );
+            if (global_config.rare_cheats.verbose_world_log) {
+                PRINT(
+                    "[seasonal_debug] current_hero_season_created=%u primary=%p conn=%x",
+                    g_last_hero_season_created,
+                    ptPrimaryForConnection,
+                    g_idGameConnection
+                );
+            }
             // d3hack-custom: RaiseParagonStatLimits() removed -- 0x6CA760 returns a
             // refcounted temporary, so writing to it had no effect on the live limit.
             // The limit is now handled by instruction patches in PortCheatCodes().
             d3::ReportAndResetLootTally();  // d3hack-custom: per-rift primal budget + roll tally
+            // d3hack-custom: DISABLED -- writing Backpack_Slots past its declared range makes the
+            // attribute serializer assert (0x67B0C0 -> 0xA2C340). Superseded by the
+            // BackpackCellUsable override, which needs no attribute change at all.
+            // d3::ApplyBackpackSlots();
             d3::ExpireGRLatchOnWorldChange();  // d3hack-custom
+            d3::ResetGoblinCacheStateOnWorldChange();  // d3hack-custom
             d3::pools::Flush();                // d3hack-custom: persist the pool carry
             if (global_config.rare_cheats.altar_dump_tables)
                 d3::DumpAltarTables();         // d3hack-custom
@@ -306,10 +321,14 @@ namespace d3 {
             }
 
             if (global_config.resolution_hack.active) {
-                const u32 outW   = global_config.resolution_hack.OutputWidthPx();
-                const u32 outH   = global_config.resolution_hack.OutputHeightPx();
-                const u32 clampH = global_config.resolution_hack.ClampTextureHeightPx();
-                const u32 clampW = global_config.resolution_hack.ClampTextureWidthPx();
+                // global_config is already budget-clamped by ApplyResolutionHackBudget(), so
+                // these are the numbers that will actually be programmed.
+                const auto &effective = global_config.resolution_hack;
+                const u32   maxTarget = d3::MaxResolutionHackOutputTargetForAspect(effective.AspectRatio());
+                const u32   outW      = effective.OutputWidthPx();
+                const u32   outH      = effective.OutputHeightPx();
+                const u32   clampH    = effective.ClampTextureHeightPx();
+                const u32   clampW    = effective.ClampTextureWidthPx();
                 PRINT(
                     "ResolutionHack config: target=%u output=%ux%u min_scale=%.1f max_scale=%.1f clamp_h=%u clamp=%ux%u defaults_only=%u",
                     global_config.resolution_hack.target_resolution,
@@ -321,6 +340,14 @@ namespace d3 {
                     clampW,
                     clampH,
                     static_cast<u32>(global_config.defaults_only)
+                );
+                PRINT(
+                    "ResolutionHack budget: aspect=%d/1000 pixels=%llu/%llu max_target=%up devmem=%u",
+                    static_cast<int>(effective.AspectRatio() * 1000.0f),
+                    static_cast<unsigned long long>(effective.OutputPixels()),
+                    static_cast<unsigned long long>(d3::MaxResolutionHackOutputPixels()),
+                    maxTarget,
+                    (d3::g_ptDevMemMode != nullptr) ? *d3::g_ptDevMemMode : 0u
                 );
             } else {
                 PRINT_LINE("ResolutionHack config: inactive");
@@ -346,6 +373,7 @@ namespace d3 {
                 d3::boot_report::RecordPatch("DynamicEvents");
                 PatchDynamicEvents();
                 PatchSeasonalItemGates();  // d3hack-custom
+                PatchBackpackRows();  // d3hack-custom
             }
             if (global_config.seasons.active) {
                 d3::boot_report::RecordPatch("DynamicSeasonal");

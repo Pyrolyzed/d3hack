@@ -8,6 +8,7 @@ namespace d3 {
     void SetupResolutionHooks();
     void SetupDebuggingHooks();
     void SetupParagonFieldWidening();  // d3hack-custom
+    void SetupSerializerRangeGuard();  // d3hack-custom
     void SetupSeasonEventHooks();
     void SetupLobbyHooks();
 }  // namespace d3
@@ -79,6 +80,18 @@ namespace d3::hook_registry {
                 .feature       = "rare_cheats.max_paragon_level > 20000",
                 .install       = &SetupParagonFieldWidening,
                 .enabled       = &EnabledParagonFieldWidening,
+                .toggle_safety = ToggleSafety::RestartRequired,
+            },
+            {
+                // d3hack-custom: gated on nothing. An attribute whose value leaves its
+                // declared range aborts the process outright (0x67B360 -> 0xA2C340), and any
+                // raised cap can do that to any attribute, so this cannot depend on a
+                // feature or a logging switch being on.
+                .name          = "SerializerRangeGuard",  // d3hack-custom
+                .owner         = "d3/hooks/debug",
+                .feature       = "always -- out-of-range attributes abort the process",
+                .install       = &SetupSerializerRangeGuard,
+                .enabled       = &Always,
                 .toggle_safety = ToggleSafety::RestartRequired,
             },
             {

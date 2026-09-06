@@ -161,6 +161,7 @@ SETUP_FUNC_PTR(SItemCrafting_LearnRecipe);              // void SItemCrafting_Le
 SETUP_FUNC_PTR(sCrafterOnLevelUp);                      // void sCrafterOnLevelUp(const Player *tPlayer, CrafterType eType, const BOOL fChangedRank, const BOOL fSendToClient)
 SETUP_FUNC_PTR(LootRollForAncientLegendary);            // void LootRollForAncientLegendary(LootSpecifier *tSpecifier, const ACDID idACDLooter)
 SETUP_FUNC_PTR(LootItemIsLegendary);                    // d3hack-custom: BOOL (GBID) -- item record flag bit 0
+SETUP_FUNC_PTR(LootItemIsEthereal);                     // d3hack-custom: BOOL (GBID) -- item record flag bit 31
 SETUP_FUNC_PTR(GlobalSNOGet);
 SETUP_FUNC_PTR(CameraSetZoomValue);        // d3hack-custom: void (int, float zoom [-1..1], float blend)
 SETUP_FUNC_PTR(CameraApplyObserverByName); // d3hack-custom: void (int nView, const char *szObserver, int nFlags)

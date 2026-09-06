@@ -237,6 +237,28 @@
     {util::ModuleIndex::Main, 0x008978B4, "patch_seasonitem_ethereal_nop"},        // cbz w0, deny  -- ETHEREALITEMSUNLOCKED
     {util::ModuleIndex::Main, 0x008978D0, "patch_seasonitem_soulshard_nop"},       // cbz w0, deny  -- SOULSHARDSUNLOCKED
     {util::ModuleIndex::Main, 0x008978EC, "patch_seasonitem_sanctified_nop"},      // cbz w0, deny  -- SANCTIFIEDITEMSUNLOCKED
+    /* d3hack-custom: backpack grid height (see PatchBackpackRows).
+       GetSlotDimensions(slot)->{w,h} was inlined into 29 copies across the inventory
+       module; these 14 are the ones the BACKPACK path (slot 0) actually reads its
+       height from -- verified by decoding each copy's 21-entry jump table and
+       resolving slot 0, with re/slotdims.py. Width stays 10, so capacity = 10 * h.
+       Every one is an ORR-immediate (a logical-immediate bitmask), which cannot
+       encode an arbitrary height, so the patch REPLACES each with a MOVZ of the
+       same destination register. Register index is in the comment and in patches.cpp. */
+    {util::ModuleIndex::Main, 0x004886DC, "patch_backpack_h00"},            // d3hack-custom: mov w9, #6  -> MOVZ w9, #rows
+    {util::ModuleIndex::Main, 0x00488BF8, "patch_backpack_h01"},            // d3hack-custom: mov w24, #6  -> MOVZ w24, #rows
+    {util::ModuleIndex::Main, 0x00488D14, "patch_backpack_h02"},            // d3hack-custom: mov w9, #6  -> MOVZ w9, #rows
+    {util::ModuleIndex::Main, 0x00488D9C, "patch_backpack_h03"},            // d3hack-custom: mov w8, #6  -> MOVZ w8, #rows
+    {util::ModuleIndex::Main, 0x00488E88, "patch_backpack_h04"},            // d3hack-custom: mov w8, #6  -> MOVZ w8, #rows
+    {util::ModuleIndex::Main, 0x00488F10, "patch_backpack_h05"},            // d3hack-custom: mov w23, #6  -> MOVZ w23, #rows
+    {util::ModuleIndex::Main, 0x004893D0, "patch_backpack_h06"},            // d3hack-custom: mov w9, #6  -> MOVZ w9, #rows
+    {util::ModuleIndex::Main, 0x00489D44, "patch_backpack_h07"},            // d3hack-custom: mov w21, #6  -> MOVZ w21, #rows
+    {util::ModuleIndex::Main, 0x0048C2A8, "patch_backpack_h08"},            // d3hack-custom: mov w8, #6  -> MOVZ w8, #rows
+    {util::ModuleIndex::Main, 0x0048C664, "patch_backpack_h09"},            // d3hack-custom: mov w9, #6  -> MOVZ w9, #rows
+    {util::ModuleIndex::Main, 0x00496B8C, "patch_backpack_h10"},            // d3hack-custom: mov w10, #6  -> MOVZ w10, #rows
+    {util::ModuleIndex::Main, 0x00496D70, "patch_backpack_h11"},            // d3hack-custom: mov w10, #6  -> MOVZ w10, #rows
+    {util::ModuleIndex::Main, 0x00497534, "patch_backpack_h12"},            // d3hack-custom: mov w10, #6  -> MOVZ w10, #rows
+    {util::ModuleIndex::Main, 0x00497904, "patch_backpack_h13"},            // d3hack-custom: mov w12, #6  -> MOVZ w12, #rows
     {util::ModuleIndex::Main, 0x004C4118, "patch_xpidx_call"},                              // d3hack-custom: sxtw x9,w20 -> BL clamp stub
     {util::ModuleIndex::Main, 0x0052725C, "patch_paragon_limit_scale"},                         // d3hack-custom: 0x5271F0 return, mov w0,w19 -> add w0,w19,w19,lsl #k
     {util::ModuleIndex::Main, 0x007F675C, "patch_paragon_statcap_spend"},                     // d3hack-custom: NOP b.gt (current+amount > limit -> reject)

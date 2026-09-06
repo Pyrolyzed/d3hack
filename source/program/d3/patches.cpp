@@ -8,6 +8,7 @@
 #include "program/build_stamp.hpp"
 #include "program/config.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -53,12 +54,14 @@ namespace d3 {
 
         g_dynamic_seasonal_patch_applied = armed;
         ++g_dynamic_seasonal_generation;
-        PRINT(
-            "[seasonal_gate] apply=%d gen=%llu reason=%s",
-            armed ? 1 : 0,
-            static_cast<unsigned long long>(g_dynamic_seasonal_generation),
-            reason ? reason : "<none>"
-        )
+        if (global_config.rare_cheats.verbose_world_log) {
+            PRINT(
+                "[seasonal_gate] apply=%d gen=%llu reason=%s",
+                armed ? 1 : 0,
+                static_cast<unsigned long long>(g_dynamic_seasonal_generation),
+                reason ? reason : "<none>"
+            )
+        }
     }
 
     static auto PatchTable(const char *name) -> uintptr_t {
@@ -212,8 +215,15 @@ namespace d3 {
         // 0x667B10: B.EQ def_667A20
         // jest.Patch<ins::Nop>(0x667B10);  // always fall through to re-init UI
 
-        auto      resolution = global_config.resolution_hack;
-        const u32 max_target = MaxResolutionHackOutputTarget();
+        auto resolution = global_config.resolution_hack;
+        // d3hack-custom: clamp on pixels, not lines. MaxResolutionHackOutputTarget() alone
+        // let AspectRatio buy render-target memory for free -- 1440 at 21:9 is 4.95 Mpx
+        // where 1440 at 16:9 is 3.69 Mpx, and nothing downstream noticed. That is the most
+        // likely reason an ultrawide config dies immediately after GfxInit with no exception
+        // dump: the allocation, not the geometry, is what fails.
+        // Normally a no-op: ApplyResolutionHackBudget() already clamped global_config at load,
+        // which is where it has to happen so the swapchain hook agrees. Kept as a net.
+        const u32 max_target = MaxResolutionHackOutputTargetForAspect(resolution.AspectRatio());
         if (resolution.target_resolution > max_target) {
             resolution.SetTargetRes(max_target);
         }
@@ -236,6 +246,37 @@ namespace d3 {
             if (outH >= 1800) {
                 heapSize = 0x69C00000;  // +0x20000000 (512 MB)
                 maxAlloc = 0x20000000;  // +0x18000000 (384 MB)
+            }
+            // d3hack-custom: the two tiers above are keyed on height, which stood in for a
+            // pixel count only while width was locked to height * 16/9. Pay for the columns
+            // the aspect ratio adds on top of that. The slope is not invented -- it is the
+            // one the two tiers already imply between them (256 MB per 2.85 Mpx, ~94 B/px,
+            // and the same for both registers).
+            //
+            // At exactly 16:9 the extra is zero, so a stock build writes the bytes it always
+            // has. The ceilings keep an extreme ratio from asking for a heap the console
+            // cannot back; the pixel budget in the target clamp above should get there first.
+            constexpr u64 kTier1Px   = 2276ull * 1280ull;  // the old `outH > 1280`  at 16:9
+            constexpr u64 kTier2Px   = 3200ull * 1800ull;  // the old `outH >= 1800` at 16:9
+            constexpr u64 kSlope     = (0x69C00000ull - 0x59C00000ull) / (kTier2Px - kTier1Px);
+            constexpr u64 kHeapMax   = 0x79C00000ull;
+            constexpr u64 kAllocMax  = 0x30000000ull;
+            const u64     px16by9    = (static_cast<u64>(outH) * static_cast<u64>(outH) * 16ull) / 9ull;
+            const u64     px         = static_cast<u64>(outW) * static_cast<u64>(outH);
+            if (px > px16by9) {
+                // Round up to the 64 KB granularity the MOVZ/LSL#16 encoding can express.
+                const u64 extra = ((px - px16by9) * kSlope + 0xFFFFull) & ~0xFFFFull;
+                heapSize        = static_cast<u32>(std::min(static_cast<u64>(heapSize) + extra, kHeapMax));
+                maxAlloc        = static_cast<u32>(std::min(static_cast<u64>(maxAlloc) + extra, kAllocMax));
+                PRINT(
+                    "[d3hack-aspect] %ux%u is %llu px vs %llu at 16:9; NVN heap %08X, max alloc %08X",
+                    outW,
+                    outH,
+                    static_cast<unsigned long long>(px),
+                    static_cast<unsigned long long>(px16by9),
+                    heapSize,
+                    maxAlloc
+                )
             }
             jest.Patch<ins::Movz>(0x0E7770, reg::W19, (heapSize >> 16), ins::ShiftValue_16);
             jest.Patch<ins::Movz>(0x0E77A0, reg::W3, (maxAlloc >> 16), ins::ShiftValue_16);
@@ -263,12 +304,20 @@ namespace d3 {
         // exactly the bytes it always has. The instruction identity here came from a
         // third-party 32:9 pchtxt, NOT from disassembling our own binary -- so this
         // unverified write stays confined to users who opted into a wide ratio.
-        if (!resolution.AspectRatioIsStock()) {
-            const u32 aspectBits = resolution.AspectRatioBits();
+        //
+        // d3hack-custom: patch the ratio the display mode ACTUALLY has, not the one that was
+        // configured. outW is rounded and evened; the constant must describe that result or
+        // the two disagree. Observed in the field at AspectRatio = 2.1: the mode said 3022
+        // wide and the game derived a 3023-wide reduced device from its own constant.
+        const float realizedAspect = (outH != 0u) ? (static_cast<float>(outW) / static_cast<float>(outH))
+                                                  : resolution.AspectRatio();
+        if (!decltype(resolution)::IsStockAspect(realizedAspect)) {
+            const u32 aspectBits = __builtin_bit_cast(u32, realizedAspect);
             jest.Patch<ins::Movz>(PatchTable("patch_resolution_targets_14_movz"), reg::W10, (aspectBits & 0xFFFFu));
             jest.Patch<ins::Movk>(PatchTable("patch_resolution_targets_15_movk"), reg::W10, (aspectBits >> 16), ins::ShiftValue_16);
-            PRINT("[d3hack-aspect] output %ux%u  aspect %d/1000  bits %08X", outW, outH,
-                  static_cast<int>(resolution.AspectRatio() * 1000.0f), aspectBits)
+            PRINT("[d3hack-aspect] output %ux%u  aspect %d/1000  bits %08X  (requested %d/1000)", outW, outH,
+                  static_cast<int>(realizedAspect * 1000.0f), aspectBits,
+                  static_cast<int>(resolution.AspectRatio() * 1000.0f))
         }
 
         // if (global_config.resolution_hack.min_res_scale >= 100.0f) {
@@ -327,16 +376,68 @@ namespace d3 {
         const bool params_seasonal = params_valid && ((tParams->dwCreationFlags & kSeasonalCreationFlag) != 0u);
         const bool spawn_seasonal  = params_valid && params_seasonal;
 
-        PRINT(
-            "[seasonal_gate] eval conn=%x flags=0x%x params_valid=%d params=%d",
-            params_valid ? tParams->idGameConnection : static_cast<uint32>(0xFFFFFFFFu),
-            params_valid ? tParams->dwCreationFlags : 0u,
-            params_valid ? 1 : 0,
-            params_seasonal ? 1 : 0
-        )
+        if (global_config.rare_cheats.verbose_world_log) {
+            PRINT(
+                "[seasonal_gate] eval conn=%x flags=0x%x params_valid=%d params=%d",
+                params_valid ? tParams->idGameConnection : static_cast<uint32>(0xFFFFFFFFu),
+                params_valid ? tParams->dwCreationFlags : 0u,
+                params_valid ? 1 : 0,
+                params_seasonal ? 1 : 0
+            )
+        }
 
         SetDynamicSeasonalPatchArmed(spawn_seasonal, spawn_seasonal ? "spawn_seasonal" : "spawn_nonseasonal");
     }
+    // d3hack-custom: enlarge the backpack.
+    //
+    // The backpack is addressed as a grid -- every item carries
+    // InventoryLocation{slot, x, y} and the backpack's valid range is x < 10, y < 6,
+    // i.e. 60 cells. On Switch that grid is never DRAWN: the console UI flattens it
+    // into the categorised scrolling list (ConsoleInventoryList*Template), so the
+    // list is 60 long purely because the grid is 10x6. Only the product matters.
+    //
+    // The engine does not care about the number. The shared stash runs 7 x 130 = 910
+    // cells through the very same validator (slot 0x0F sets w9=0x82), with no
+    // special-casing anywhere, which is the evidence that 6 is a value and not an
+    // assumption.
+    //
+    // GetSlotDimensions(slot)->{w,h} was inlined into 29 copies across the inventory
+    // module. Only 14 of those are on the path the BACKPACK (slot 0) reads its height
+    // from -- some copies let slot 0 fall through to the pre-jump defaults, others
+    // give it an explicit case. They were identified by decoding each copy's 21-entry
+    // jump table and resolving entry 0, NOT by grepping for the constant 6: the module
+    // has 31 unrelated sixes, and a missed site means items placed where some other
+    // routine will never look for them.
+    //
+    // Every site is `orr wD, wzr, #6` -- a logical immediate, which can only encode
+    // repeating bitmask patterns. 20 is not one. So each is REPLACED with a MOVZ of
+    // the same destination register, which takes any 0..0xFFFF. Same length, same
+    // register, no flags.
+    //
+    // Width is deliberately left at 10: y is the axis these 14 sites control, and
+    // leaving x alone keeps every row-major `y * width + x` calculation consistent.
+    void PatchBackpackRows() {
+        const int nRows = global_config.loot_modifiers.BackpackRows;
+        if (!global_config.loot_modifiers.active || nRows <= 6)
+            return;  // 6 is stock; treat anything at or below it as "no override"
+
+        // W-register each copy materialises the height into. Order matches
+        // patch_backpack_h00..13 in offsets_patch_only.inl.
+        static constexpr uchar s_arRegs[] = {9, 24, 9, 8, 8, 23, 9, 21, 8, 9, 10, 10, 10, 12};
+        constexpr int          kSites     = static_cast<int>(sizeof(s_arRegs) / sizeof(s_arRegs[0]));
+
+        auto jest = patch::RandomAccessPatcher();
+        for (int i = 0; i < kSites; ++i) {
+            char szKey[32];
+            snprintf(szKey, sizeof(szKey), "patch_backpack_h%02d", i);
+            jest.Patch<ins::Movz>(PatchTable(szKey),
+                                  reg::Register(reg::RegisterKind::W, s_arRegs[i]),
+                                  static_cast<u16>(nRows));
+        }
+        PRINT("[d3hack-custom] backpack grid 10 x %d = %d slots (%d sites patched, stock was 60)",
+              nRows, nRows * 10, kSites)
+    }
+
 
     // d3hack-custom: let seasonal-theme items exist outside a seasonal game.
     //
@@ -2638,7 +2739,11 @@ namespace d3 {
     }
 
     void ShiftSetBonusTiers() {
-        if (!global_config.rare_cheats.set_bonus_tier_shift)
+        // d3hack-custom: two rules, one field. SetBonusPieceFloor wins when set, and the
+        // tier shift is then skipped entirely rather than applied first -- see the note on
+        // set_bonus_piece_floor in config.hpp.
+        const s32 nPieceFloor = static_cast<s32>(global_config.rare_cheats.set_bonus_piece_floor);
+        if (!global_config.rare_cheats.set_bonus_tier_shift && nPieceFloor <= 0)
             return;
         if (GBRecordGet == nullptr || GBGetHandlePool == nullptr || GBGetHandlePool() == nullptr)
             return;
@@ -2690,14 +2795,22 @@ namespace d3 {
                 arAll.push_back(Shift {static_cast<s32>(g), nSet, nCnt, nCnt});
             }
 
-            // One tier down, resolved against the ORIGINAL counts of the same set.
-            for (auto &a : arAll) {
-                s32 nBelow = 0;
-                for (const auto &b : arAll)
-                    if (b.nSet == a.nSet && b.nWas < a.nWas && b.nWas > nBelow)
-                        nBelow = b.nWas;
-                if (nBelow > 0)
-                    a.nNow = nBelow;
+            if (nPieceFloor > 0) {
+                // Floor every tier at one count. Never raises a tier that is already at or
+                // below the floor, so a 2pc stays a 2pc rather than becoming a 1pc.
+                for (auto &a : arAll)
+                    if (a.nWas > nPieceFloor)
+                        a.nNow = nPieceFloor;
+            } else {
+                // One tier down, resolved against the ORIGINAL counts of the same set.
+                for (auto &a : arAll) {
+                    s32 nBelow = 0;
+                    for (const auto &b : arAll)
+                        if (b.nSet == a.nSet && b.nWas < a.nWas && b.nWas > nBelow)
+                            nBelow = b.nWas;
+                    if (nBelow > 0)
+                        a.nNow = nBelow;
+                }
             }
 
             for (const auto &a : arAll) {
@@ -2707,8 +2820,13 @@ namespace d3 {
                 if (a.nNow != a.nWas)
                     s_arPlan.push_back(a);
             }
-            PRINT("[d3hack-custom] set bonus tiers: %u records, %u bonuses move down a tier",
-                  static_cast<u32>(arAll.size()), static_cast<u32>(s_arPlan.size()))
+            if (nPieceFloor > 0) {
+                PRINT("[d3hack-custom] set bonus tiers: PIECE FLOOR %d -- %u records, %u bonuses move",
+                      nPieceFloor, static_cast<u32>(arAll.size()), static_cast<u32>(s_arPlan.size()))
+            } else {
+                PRINT("[d3hack-custom] set bonus tiers: %u records, %u bonuses move down a tier",
+                      static_cast<u32>(arAll.size()), static_cast<u32>(s_arPlan.size()))
+            }
         }
 
         if (s_arPlan.empty())

@@ -102,10 +102,12 @@ struct PatchConfig {
                        : kAspectRatio;
         }
 
-        constexpr bool AspectRatioIsStock() const {
-            const float d = AspectRatio() - kAspectRatio;
+        static constexpr bool IsStockAspect(float aspect) {
+            const float d = aspect - kAspectRatio;
             return (d > -0.0005f) && (d < 0.0005f);
         }
+
+        constexpr bool AspectRatioIsStock() const { return IsStockAspect(AspectRatio()); }
 
         // IEEE-754 bits of the aspect ratio, for the MOVZ/MOVK pair that builds the HUD
         // aspect constant in W10 (0x0E7868 / 0x0E786C). BOTH halves have to be patched:
@@ -113,8 +115,18 @@ struct PatchConfig {
         // so a patch that only rewrites the exponent works for 32:9 and nothing else.
         constexpr u32 AspectRatioBits() const { return __builtin_bit_cast(u32, AspectRatio()); }
 
+        // d3hack-custom: round, then force even -- and do BOTH here, so every width in this
+        // struct is derived the same way.
+        //
+        // Truncating is what made AspectRatio = 2.1 boot with a 3022-wide backbuffer while
+        // the game's own patched aspect constant derived 3023 for the reduced device: 2.1f is
+        // really 2.09999990, so 1440 * 2.1f = 3023.99986, the cast threw a pixel away and
+        // AlignEven downstream took a second one. The declared display mode and the constant
+        // the game computes from then disagreed. Rounding also stops the natural spelling of
+        // 21.5:9 (2.38888889 -> 3439.99992 -> 3438) from quietly losing two columns.
         constexpr u32 WidthForHeight(u32 height) const {
-            return static_cast<u32>(static_cast<float>(height) * AspectRatio());
+            const float width = static_cast<float>(height) * AspectRatio();
+            return AlignEven(static_cast<u32>(width + 0.5f));
         }
 
         constexpr void SetTargetRes(u32 height) { target_resolution = height; }
@@ -122,8 +134,11 @@ struct PatchConfig {
         static constexpr u32 AlignEven(u32 value) { return value & ~1u; }
         // static constexpr u32 AlignDownPow2(u32 value, u32 alignment) { return value & ~(alignment - 1u); }
 
-        constexpr u32 OutputWidthPx() const { return AlignEven(WidthForHeight(OutputHeightPx())); }
+        constexpr u32 OutputWidthPx() const { return WidthForHeight(OutputHeightPx()); }
         constexpr u32 OutputHeightPx() const { return AlignEven(target_resolution); }
+        constexpr u64 OutputPixels() const {
+            return static_cast<u64>(OutputWidthPx()) * static_cast<u64>(OutputHeightPx());
+        }
 
         static float NormalizeHandheldScale(float value) {
             if (value <= 0.0f) {
@@ -252,6 +267,8 @@ struct PatchConfig {
         float  view_dolly_zmin        = -140.0f;// d3hack-custom: only view matrices whose translation z falls between ZMin and ZMax get dollied. The builder serves every camera in the engine (world, shadow cascade, light, UI portrait), so this picks which one. Read the z values off the [d3hack-dolly] census.
         float  view_dolly_zmax        = -60.0f; // d3hack-custom: see ViewDollyZMin.
         bool   power_formula_probe     = false;// d3hack-custom: log every distinct (power SNO, Script Formula N) -> value the game evaluates. How you find the number behind a skill.
+        bool   backpack_grid_probe     = false;// d3hack-custom: trace every cell of a BACKPACK grid walk (0x488620) and the per-cell callback's return. Answers whether the per-cell store is capped at the stock 60.
+        int    backpack_grid_probe_cells = 260;// d3hack-custom: per-walk cap on backpack cell trace lines. Diagnostics only.
         bool   power_random_probe      = false;// d3hack-custom: log which powers roll the script RNG, and what they roll. Finds proc chances that are not Script Formulas.
         bool   rift_progress_probe     = false;// d3hack-custom: TEMPORARY. Log every write to Dungeon_Finder_Progress_Percent (0x524) -- the Greater Rift progress bar -- on BOTH the int and float setters, with the value and the caller. Establishes which accessor carries it, whether the value is an absolute percent or a delta, and how often it is written, before anything tries to scale it.
         int    damage_number_tiers     = 0;    // d3hack-custom: show only the N highest magnitudes of damage and hide everything below (0 = off, 2 = the sensible one). Once you are hitting for T the M numbers are noise; at Q the B numbers are. The watermark is the biggest tier you have actually dealt, and it resets on every world entry so a floor you outgrow recalibrates instead of staying calibrated to one lucky crit forever.
@@ -266,6 +283,32 @@ struct PatchConfig {
         std::string power_formula_index_list = ""; // d3hack-custom: comma-separated Script Formula indices to scale. Overrides PowerFormulaScaleIndex when set. Lets every radius-looking formula of a power move at once.
         int    power_formula_index     = -1;   // d3hack-custom: which Script Formula of that power to scale (-1 = all of them)
         int    power_formula_percent   = 100;  // d3hack-custom: scale applied to it, in percent
+        bool   hoarder_gold_probe      = false;// d3hack-custom: name every gem and its rank, and log the first gold grant of each (currency, reason) pair with its caller. This is how HoarderGoldPowerSno gets filled in: the [d3hack-gold] JEWEL_RANK line names the gem item ("Unique_Gem_0NN_x1") with the rank you see on the tooltip, and the [d3hack-item] ITEM_POWER_PASSIVE line with the SAME number gives the power SNO to configure.
+        int    hoarder_gold_power_sno  = 0;    // d3hack-custom: item-passive power SNO whose RANK scales gold -- Boon of the Hoarder's ItemPassive_Unique_Gem_0NN_x1 (0 = off). Not hardcoded because which NN it is cannot be read out of the shipped romfs; the probe prints it.
+        int    hoarder_gold_min_rank   = 50;   // d3hack-custom: rank at which the extra scaling STARTS. Rank 50 is where the gem's own bonus reaches 100%, so this adds on top of a finished stock curve rather than replacing it.
+        int    hoarder_gold_pct_per_rank = 0;  // d3hack-custom: extra gold percent per rank above HoarderGoldMinRank (0 = off). 2 mirrors the gem's own per-rank rate, so rank 550 is roughly x11 gold.
+        int    hoarder_gold_max_percent = 100000;// d3hack-custom: ceiling on the resulting multiplier, in percent (100 = no gain). With gems uncapped at 10000 the raw formula would otherwise run to five figures.
+        std::string hoarder_gold_gem_name = "Boon of the Hoarder"; // d3hack-custom: which gem the rank comes from, matched against the DISPLAY name the player reads or the internal name ("Unique_Gem_0NN_x1"), case-insensitively. Empty disables the by-name binding and leaves HoarderGoldPowerSno as the only way in.
+        // d3hack-custom: FLAT gold multiplier, percent. 100 = off and is the default, so a
+        // config that fails to parse pays stock gold. Applies at ACD_ModifyCurrencyAmount --
+        // the single door every gold change comes through -- so the pile on the floor and the
+        // number in the purse always agree. Only ever RAISES a positive grant: spends and
+        // refunds pass through untouched, which is what stops a multiplier making things cost
+        // more. Needs no gem and no rank, so unlike HoarderGoldPercentPerRank it works from
+        // level 1. Composes multiplicatively with the gem-rank bonus when both are on.
+        // d3hack-custom: COSMETIC PET knobs. The pet is a separate actor from the player, so
+        // these act on the PET's own ACD -- the player's GOLD_PICKUP_RADIUS is a different
+        // number and is deliberately not touched.
+        //
+        // NOTE: which attributes a cosmetic pet actually reads is NOT established. These are
+        // the plausible ones (movement scalars, GOLD_PICKUP_RADIUS) and each logs the first
+        // few times it CHANGES a value, so one run says whether the lever is real. If those
+        // lines never appear, PetProbe names what the pet reads instead of guessing again.
+        int    pet_speed_percent      = 100;   // 100 = off. Multiplies the pet's movement attributes.
+        float  pet_pickup_radius      = 0.0f;  // 0 = off. Overrides GOLD_PICKUP_RADIUS on the pet.
+        bool   pet_probe              = false; // own switch: log every distinct attribute read on a pet ACD
+        int    gold_multiplier_percent = 100;
+        int    hoarder_gold_currency   = 0;    // d3hack-custom: which CurrencyType the multiplier applies to. Gold is expected to be 0; the probe's grant lines print the real id, so a wrong guess is visible rather than silent.
         bool   wells_as_pools          = false;// d3hack-custom: every spawned Health Well becomes a Pool of Reflection instead -- actor SNO 138989 rewritten to 373463 in the level-area spawn data
         bool   well_spawn_probe        = false;// d3hack-custom: name every actor SNO the level-area populator places, once each. Use it to find well variants the swap misses.
         int    gr_density_multiplier   = 1;    // d3hack-custom: spawn groups per level area INSIDE A RIFT (1 = stock). Applies to Greater and Nephalem rifts alike -- what is testable at world-generation time is "this floor was given a rift tileset", not which kind of rift it belongs to. Outside a rift, WorldDensityMultiplier is used instead. A MapDensityOverrides entry beats both.
@@ -285,6 +328,17 @@ struct PatchConfig {
         bool   socket_affix_any_slot   = false;// d3hack-custom: let the Sockets affixes roll on every equipment slot. Pointless while free sockets are on -- it only creates dead rolls.
         bool   socket_affix_suppress   = true; // d3hack-custom: remove the Sockets affixes from every item group, so they can never drop or be offered by the Mystic. Correct whenever FreeSocketsOnEveryItem > 0.
         bool   set_bonus_tier_shift    = true; // d3hack-custom: shift every set bonus down one tier -- the 4pc lands on the 2pc and the 6pc lands on the 4pc
+        // d3hack-custom: force EVERY set bonus tier down to this piece count (0 = off).
+        // SetBonusTierShift moves each bonus to the next tier BELOW it in the same set,
+        // so a 6pc lands at 4. This instead floors every tier at one number: 2 makes every
+        // set's top bonus land at 2 pieces, which is what lets sets be mixed freely.
+        //
+        // Applied INSTEAD of the tier shift, never on top of it -- two rules writing the
+        // same field is how a set ends up at a count neither rule asked for. A record whose
+        // count is already at or below the floor is left exactly as it is, so a 2pc never
+        // becomes a 1pc. 0 is the safe default: a config that fails to parse gets the
+        // existing one-tier-down behaviour, not a new one.
+        int    set_bonus_piece_floor   = 0;
         bool   set_bonus_dump          = false;// d3hack-custom: log every set bonus record (set gbid, pieces required) as the tier shift is worked out
         bool   set_bonus_any_weapon    = false;// d3hack-custom: apply a set bonus's damage multiplier regardless of the weapon equipped. Shadow's Mantle grants ITEM_POWER_PASSIVE[318386] = 60 (the 6000%) at all times, but folds it into MULTIPLICATIVE_DAMAGE_PERCENT_BONUS_FOR_SKILL[Impale] only when a melee weapon is held -- 61.0 with a melee weapon, 1.0 with a bow. This re-adds it.
         bool   damage_bonus_probe      = false;// d3hack-custom: log every write of the skill-damage-bonus attributes (0x4AC/0x4AD/0x5A7/0x5A8/0x5A9) with the skill SNO it is keyed to, the value and the caller. Diff a melee weapon against a bow to find where a set bonus's weapon gate lives.
@@ -360,7 +414,14 @@ struct PatchConfig {
         bool   shrine_duration_probe   = false;// d3hack-custom: log every PowerBuffSetDuration call with its power id. How you find the PYLON power ids, which are not known yet -- the four shrine ones are.
         bool   camera_field_dump      = false;// d3hack-custom: one-shot dump of the camera/view object's float fields, from the view builder's caller (x19 at 0x29B590, untouched at function entry). Looking for a far clip plane: the seam that appears when the dolly pulls back would be geometry crossing it, and unlike the fog planes -- which are authored per level and reach the shader as scene_fogPlanes -- a clip plane is one float we can move.
         bool   partial_currency_pickup = true; // d3hack-custom: pick up as much of a blood shard pile as fits, PC-style, instead of refusing the whole pile. Stock code tests (current + pile) <= cap at 0x48C448 and bails to an item-placement fallback when it fails -- and blood shards have no inventory slot, so that fallback always ends in "You have no place to put that item". The clamp itself already exists downstream at 0x48F2B0; this only stops the gate from skipping it.
-        bool   xp_scale_rested        = false;// d3hack-custom: also apply the pool/GR multipliers to the w3==0 grant. That path was skipped on the belief it was derived from the already-scaled amount, but measurement disproved it: 8,843,177,984 against a 41,849,104 kill, 15x LARGER than the scaled output on the same event. It carries 16 of every 22 large awards including ~1/3 of the GR completion, which is why the effective multiplier wanders between ~1x and 13.5x.
+        int    paragon_xp_cost_from    = 20000;// d3hack-custom: paragon level above which levels start costing more. The game's own cost is flat past 19999 (table has 20000 rows), which also freezes the grant cap and removes the only thing that self-corrects an oversized multiplier. Lower this to exercise the feature without a 20000-paragon hero.
+        int    paragon_xp_cost_per1000 = 0;    // d3hack-custom: extra cost percent per 1000 paragon levels above paragon_xp_cost_from. 0 = off, and OFF IS THE SAFE DEFAULT: this is the one thing in Deliver() that can hand back LESS than the game offered. 100 means levels cost double 1000 levels above the start, triple 2000 above, and so on.
+        bool   goblin_cache_drop       = false;// d3hack-custom: turn ONE of every treasure goblin's drops into a Horadric cache. Rewrites the item gbid at LootSpecifier+8 during the loot roll, so the game builds the cache itself -- affixes are rolled afterwards against the new gbid. Off by default because it converts a drop rather than adding one.
+        u32    goblin_cache_gbid       = 0u;// d3hack-custom: which cache a goblin drops. 0 = ROTATE the five per-act Torment13 caches (A1..A5), which is what you want: Greater only exists at Torment 1, the per-act ones go to Torment13. Set a specific gbid to pin one act. Names and gbids come from the GB_ITEMS scan -- there are 216 of them.
+        bool   goblin_cache_probe      = false;// d3hack-custom: log ExperienceDropLootForAll (0x7A1B00) and FlippyDropCreateOnActor (0x7A4A00) argument registers, plus the Horadric cache and treasure goblin gbids. Read-only, answers what the arguments mean before anything calls them. Inline hooks on purpose: no prototype is declared, so none can be declared wrong.
+        bool   verbose_world_log      = false;// d3hack-custom: per-world diagnostic chatter -- the rift floor plan, tileset picks, level-area resolves and the seasonal gate. Useful while working on rifts, pure noise otherwise, and it is LOGGING ONLY: nothing about the game changes with this off. Default quiet.
+        bool   xp_ledger              = false;// d3hack-custom: log EVERY experience grant in order -- raw in, multiplier, carry in/out, amount handed over, paragon level, GR tier, difficulty. Verbose by design and not rate limited: both XP bugs found so far were invisible in totals and obvious in sequence.
+        bool   xp_scale_rested        = false;// d3hack-custom: also apply the pool/GR multipliers to the w3==0 grant. !! LEAVE THIS OFF. !! It was turned on because the rested path looked too large to be derived from the already-scaled amount (8,843,177,984 against a 41,849,104 kill). The 2026-09-05 trace disproves that reading: the w3==0 call arrives with raw EXACTLY equal to the `need` printed on the preceding line, repeatedly -- it IS derived from what we just granted. Scaling it re-multiplies our own output and re-spends the carry, so each kill yields two 25-level grants and the persistent carry compounds across sessions (1.199e17 -> 3.147e17 in eight minutes, ~19 paragon levels per kill, then a heap OOM abort). The 211x that motivated this is the loop, not a missed multiplier.
         int    xp_hook_mode            = 1;    // d3hack-custom: 0 = do not install the experience hook at all; 1 = install it but pass straight through; 2 = also read the hero's level and cap, still granting the stock amount; 3 = full. A bisect that needs no rebuild.
         bool   pool_touch_hook         = false;// d3hack-custom: hook the Pool of Reflection touch event directly instead of inferring it
         bool   pool_slot_probe         = false;// d3hack-custom: log the pool slot attributes as they change
@@ -382,6 +443,8 @@ struct PatchConfig {
         int         AncientMinGRLevel         = 120;
         int         PrimalMinGRLevel          = 151;
         int         PrimalGuaranteedCount     = 3;
+        bool        EtherealAlwaysPrimal      = false;
+        int         BackpackRows              = 6;     // d3hack-custom: backpack grid height; capacity = 10 * rows. 6 = stock (60 slots).
         std::string AncientRank               = "Normal";
         int         AncientRankValue          = 0;
     } loot_modifiers;

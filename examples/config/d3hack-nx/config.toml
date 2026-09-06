@@ -50,10 +50,12 @@ Visible = false
 [loot_modifiers]
 AncientMinGRLevel = 120
 AncientRank = 'Normal'
+BackpackRows = 20
 DisableAncientDrops = false
 DisablePrimalAncientDrops = false
 DisableTormentCheck = true
 DisableTormentDrops = false
+EtherealAlwaysPrimal = true
 ForcedILevel = 0
 PrimalGuaranteedCount = 3
 PrimalMinGRLevel = 151
@@ -202,6 +204,21 @@ ShrineDurationProbe = false
 XpCensus = false
 ShardProbe = false
 CameraFieldDump = false
+HoarderGoldProbe = false
+HoarderGoldGemName = "Boon of the Hoarder"
+HoarderGoldPowerSno = 0
+HoarderGoldMinRank = 50
+HoarderGoldPercentPerRank = 0
+HoarderGoldMaxPercent = 100000
+HoarderGoldCurrency = 0
+
+SetBonusPieceFloor = 2
+PetSpeedPercent = 300
+PetPickupRadius = 50.0
+PetProbe = false
+GoldMultiplierPercent = 1000
+VerboseWorldLog = false
+
 [resolution_hack]
 AspectRatio = 1.7778
 ClampTextureResolution = 1152

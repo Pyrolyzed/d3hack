@@ -1,5 +1,5 @@
 ===========================================================================
- D3HACK v3.16
+ D3HACK v3.17
  A gameplay mod for Diablo III: Eternal Collection (Nintendo Switch)
 ===========================================================================
 
@@ -29,6 +29,7 @@ that controls it.
    3 free sockets on every equippable item ....... FreeSocketsOnEveryItem = 3
    Sockets affix removed from all roll tables .... SocketAffixSuppress = true
    Set bonuses shift down a tier (4pc at 2) ...... SetBonusTierShift = true
+   ...or put EVERY set bonus at 2 pieces ......... SetBonusPieceFloor = 2
    Kanai augment gem rank cap 150 -> 10000 ....... LegendaryGemUncapped = true
    Set damage bonuses ignore the weapon requirement  SetBonusAnyWeapon = true
 
@@ -40,7 +41,7 @@ that controls it.
 
  EXPERIENCE
    Experience multiplier ......................... ExperienceMultiplier = 32
-   ...applied to the rested half of a kill too ... XpScaleRested = true
+   (XpScaleRested is NOT one of these -- see below, leave it false)
    Greater Rift completion bonus multiplier ...... ExperienceMultiplierHighGR = 2
    Every health well is a Pool of Reflection ..... HealthWellsAsPoolsOfReflection = true
    Pools give a permanent, stacking XP bonus ..... PoolOfReflectionXpPercent = 25
@@ -96,6 +97,7 @@ that controls it.
 
  CURRENCY
    Pick up part of a blood shard pile ............ PartialCurrencyPickup = true
+   Multiply every gold pickup .................... GoldMultiplierPercent = 1000
 
 
 ---------------------------------------------------------------------------
@@ -176,6 +178,24 @@ SET BONUSES SHIFT DOWN ONE TIER
     Ring of Royal Grandeur still stacks on top, so it now buys the top tier
     at three pieces.
 
+ALL SET BONUSES AT ONE PIECE COUNT
+    The tier shift moves each bonus to the next tier BELOW it in the same set,
+    so a 6-piece still wants 4. This floors every tier at one number instead:
+    at 2, every set's top bonus lands on 2 pieces, so you can wear three sets
+    at once and get all of their best bonuses.
+        SetBonusPieceFloor = 2            0 = off, use the tier shift
+
+    It replaces the tier shift rather than stacking with it -- when it is set,
+    SetBonusTierShift is skipped entirely. Two rules writing the same field is
+    how a set ends up at a count neither rule asked for.
+
+    Nothing is ever raised: a bonus already at or below the floor is left
+    exactly as it is, so a 2pc never becomes a 1pc. Range 0..12.
+
+    The log names which rule ran:
+        [d3hack-custom] set bonus tiers: PIECE FLOOR 2 -- N records, M bonuses move
+        [d3hack-custom] set bonus tiers: rewrote M bonuses, M verified stuck
+
 
 ---------------------------------------------------------------------------
  MONSTERS AND DENSITY
@@ -255,15 +275,21 @@ JUGGERNAUT, WORMHOLE AND SHIELDING DISABLED
  EXPERIENCE AND POOLS OF REFLECTION
 ---------------------------------------------------------------------------
 
-THE EXPERIENCE MULTIPLIER NOW APPLIES TO ALL OF A KILL
-    Rested experience -- the bonus pool the game hands out alongside normal
-    kill XP -- was never being scaled. It carries most of the large awards,
-    including about a third of a Greater Rift completion, so the rate you
-    actually got wandered between 1x and the number you set depending on what
-    you were killing.
-        XpScaleRested = true              false = stock
+XPSCALERESTED -- LEAVE THIS OFF
+    This entry used to recommend true. That was wrong and is corrected here.
 
-    If your experience gain used to feel inconsistent, this was why.
+    The reasoning was that the "rested" grant looked far too large to be
+    derived from the kill we had already scaled (8,843,177,984 against a
+    41,849,104 kill), so it must be an unscaled second path. The 2026-09-05
+    trace disproves that: the w3==0 call arrives with its raw value EXACTLY
+    equal to the `need` printed on the line before it, repeatedly. It IS
+    derived from what we just granted.
+
+    Scaling it therefore re-multiplies our own output and re-spends the carry.
+    Each kill yields two 25-level grants and the carry compounds across
+    sessions -- measured going 1.199e17 -> 3.147e17 in eight minutes, roughly
+    19 paragon levels per kill, ending in a heap OOM abort.
+        XpScaleRested = false             true = the runaway described above
 
 EVERY HEALTH WELL IS A POOL OF REFLECTION
     Not a well that also grants a pool -- the game genuinely spawns a pool,
@@ -651,6 +677,35 @@ PICK UP PART OF A PILE
     ground at its reduced count, the way the PC version works. Nothing is
     lost and nothing is duplicated. At the cap it declines cleanly.
 
+MULTIPLY EVERY GOLD PICKUP
+    A flat multiplier on gold. No gem, no rank, no level requirement -- unlike
+    HoarderGoldPercentPerRank, which needs Boon of the Hoarder equipped and so
+    does nothing at all while you are levelling.
+        GoldMultiplierPercent = 1000      100 = off, and off is the default
+
+    1000 is 10x. The range is 100..1000000.
+
+    It applies at ACD_ModifyCurrencyAmount, the single door every gold change
+    comes through, so the pile on the floor and the number in your purse always
+    agree -- there is only one edit.
+
+    Only POSITIVE grants are touched. Spends and refunds arrive negative and
+    return before the multiplier is read, so nothing you buy gets more
+    expensive. Repair, crafting and enchanting costs are unchanged.
+
+    If Boon of the Hoarder is also equipped and HoarderGoldPercentPerRank is
+    set, the two compose multiplicatively, capped at 1,000,000x overall.
+
+    What this is FOR: gold buys a level-appropriate weapon from the Blacksmith
+    while you level, which is the fastest answer to outlevelling your gear.
+    Be aware crafting also wants Reusable Parts and Arcane Dust from salvaging,
+    and no amount of gold produces those -- past a point materials are the
+    limit, not gold.
+
+    The log names the multiplier on the first few grants:
+        [d3hack-gold] gold hook installed on ACD_ModifyCurrencyAmount (flat=1000% ...)
+        [d3hack-gold] x10.00 (flat 1000%, gem-rank composed) : 480 -> 4800
+
 ---------------------------------------------------------------------------
  QUALITY OF LIFE
 ---------------------------------------------------------------------------
@@ -807,7 +862,82 @@ WHERE THE LOGS ARE
 
 
 ===========================================================================
- 6. WHAT CHANGED IN v3.16
+ 6. WHAT CHANGED IN v3.17
+===========================================================================
+
+NEW FEATURES
+  * A flat GOLD MULTIPLIER. No gem, no rank, no level requirement -- unlike
+    HoarderGoldPercentPerRank, which needs Boon of the Hoarder equipped and so
+    does nothing at all while you are levelling.
+        GoldMultiplierPercent = 1000      100 = off, 1000 = 10x, max 1000000
+    Applies at ACD_ModifyCurrencyAmount, the single door every gold change comes
+    through, so the pile on the floor and the number in your purse always agree.
+    Only POSITIVE grants are touched: spends and refunds return before the
+    multiplier is read, so nothing you buy gets more expensive.
+    VERIFIED in game: a 16 gold pickup was delivered as 160, and a spend logged
+    as -11 passed through unmultiplied.
+
+  * COSMETIC PET SPEED and PET GOLD PICKUP RADIUS.
+        PetSpeedPercent  = 300            100 = off
+        PetPickupRadius  = 50.0           0   = off
+    The pet is its own actor, so these act on the PET's ACD and leave your own
+    movement and pickup radius alone. VERIFIED in game: pet fast, player normal.
+    Note class minions (Witch Doctor dogs, Necromancer skeletons, Mystic Ally)
+    are pets by this test and will also move faster.
+
+  * ALL SET BONUSES AT ONE PIECE COUNT.
+        SetBonusPieceFloor = 2            0 = off, use SetBonusTierShift
+    Floors every set bonus tier at one number instead of shifting each down by
+    one, so every set's top bonus lands at 2 pieces and sets can be mixed freely.
+    Replaces the tier shift when set rather than stacking with it, and never
+    raises a tier already at or below the floor. 140 of 268 bonus records move.
+
+FIXES
+  * GOBLIN CACHE BACKLOG LEAKED ACROSS GAMES, and could kill the process.
+    A goblin's cache is armed on death and consumed by the next loot roll. That
+    counter was never reset on a world or game change, so caches armed in one
+    game rewrote the first loot roll of the NEXT one. Measured: the last goblin
+    died at 20:08, a new game was created at 20:13:17, and at 20:13:23 a swap
+    fired reading "3 still pending" -- followed 0.11s later by a hard process
+    abort in the attribute serializer (0xA2C340, undefined instruction).
+    Now cleared at sInitializeWorld. Cost: a goblin killed in the instant of a
+    world change loses its cache.
+
+  * The goblin victim REGISTER DUMP and SNO census printed with
+    GoblinCacheProbe = false, because the hook installs on the drop feature and
+    the dump sat outside any probe test. That is what made D3Debug.txt 400 KB of
+    hex. Both are now behind the probe flag. No behaviour change.
+
+DIAGNOSTICS
+  * PetProbe -- reports distinct (actorType, PET_OWNER, PET_TYPE) tuples for
+    actors reading the movement totals or gold pickup radius. This is what
+    identified the pet: PET_OWNER reads -1 (absent) on everything including the
+    player, while PET_TYPE reads 25 on a cosmetic pet and 0 on the player.
+
+DOCUMENTATION CORRECTED
+  * XpScaleRested was documented as a shipped feature at true. It is not, and
+    section 1 now explains why: it re-multiplies the mod's own output and
+    compounds the carry (1.199e17 -> 3.147e17 in eight minutes, then a heap OOM
+    abort). The original reasoning is recorded so it is not re-derived.
+
+KNOWN ISSUES
+  * RIFT MAP BANS ARE NOT SUBSTITUTING. With VerboseWorldLog on, the plan dump
+    identifies a banned map and then leaves it in place:
+        floor 1: map=275943 "x1_lr_tileset_rootcave" ... REJECTED
+        --- 4 floors, 1 still unwanted, 0 swapped, 0 refused ---
+    Bans are read and matched; the replacement never happens. Under
+    investigation. Banned maps can still be rolled.
+
+  * Several settings in config.toml do nothing. AllowDuplicateLegendaries and
+    CameraFarDistance have no reader anywhere in the source. Everything in
+    lobby.hpp -- an infinite gold pickup radius, HAS_INFINITE_SHRINE_BUFFS,
+    GOLD_FIND_TOTAL, ATTACKS_PER_SECOND_TOTAL, guaranteed legendary chance -- is
+    gated on debug.enable_crashes and is inert. Do not switch that flag on to
+    reach one of them: it enables the whole bundle at once.
+
+
+===========================================================================
+ FROM v3.16
 ===========================================================================
 
 NEW FEATURES

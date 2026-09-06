@@ -276,6 +276,12 @@ namespace exl::reloc {
             // d3hack-custom: the legendary gate LootRollForAncientLegendary itself uses
             // at 0x88DE40 before doing any ancient work.
             { util::ModuleIndex::Main, 0x4F47E0, "sym_LootItemIsLegendary" },
+            // d3hack-custom: the ethereal gate the SAME function uses at 0x88DE50, right
+            // after the legendary one. Identical shape to LootItemIsLegendary -- fetch the
+            // item GameBalance record via GBRecordGet and test a bit in the flags dword at
+            // +0x20 (bit 31 here; legendary is bit 0, seasonal-only is bit 26). Pure read,
+            // no state, safe to call from a loot hook.
+            { util::ModuleIndex::Main, 0x50E810, "sym_LootItemIsEthereal" },
             { util::ModuleIndex::Main, 0x0B8740, "sym_LocalPlayerGet" },
             { util::ModuleIndex::Main, 0x51FC40, "sym_PlayerGetByACD" },
             { util::ModuleIndex::Main, 0x51CFF0, "sym_PlayerGetHeroDisplayName" },

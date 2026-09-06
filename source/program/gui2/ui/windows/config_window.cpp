@@ -645,7 +645,10 @@ namespace d3::gui2::ui::windows {
             ImGui::BeginDisabled(!cfg.resolution_hack.active);
             render_subgroup_header("gui.resolution_group_output", "Output Targeting", false);
             FormLayout output_layout = begin_form_layout("cfg_resolution_output_form", output_max_label);
-            const int  max_target    = static_cast<int>(d3::MaxResolutionHackOutputTarget());
+            // d3hack-custom: the slider ceiling has to follow AspectRatio, or the GUI happily
+            // offers a target the patch will clamp away (or, before the clamp existed, one
+            // that takes the graphics heap past what it can allocate).
+            const int  max_target    = static_cast<int>(d3::MaxResolutionHackOutputTargetForAspect(cfg.resolution_hack.AspectRatio()));
             int        target        = static_cast<int>(cfg.resolution_hack.target_resolution);
             if (target > max_target) {
                 target = max_target;
@@ -1058,12 +1061,13 @@ namespace d3::gui2::ui::windows {
             ImGui::BeginDisabled(!cfg.loot_modifiers.active);
             ImGui::Spacing();
             ImGui::TextUnformatted(overlay_.tr("gui.loot_group_toggles", "Drop toggles"));
-            const std::array<BoolRowSpec, 5> rows = {{
+            const std::array<BoolRowSpec, 6> rows = {{
                 {"gui.loot_disable_ancient", "Disable ancient drops", "##loot_disable_ancient", &cfg.loot_modifiers.DisableAncientDrops, &global_config.loot_modifiers.DisableAncientDrops, false},
                 {"gui.loot_disable_primal", "Disable primal ancient drops", "##loot_disable_primal", &cfg.loot_modifiers.DisablePrimalAncientDrops, &global_config.loot_modifiers.DisablePrimalAncientDrops, false},
                 {"gui.loot_disable_torment", "Disable torment drops", "##loot_disable_torment", &cfg.loot_modifiers.DisableTormentDrops, &global_config.loot_modifiers.DisableTormentDrops, false},
                 {"gui.loot_disable_torment_check", "Disable torment check", "##loot_disable_torment_check", &cfg.loot_modifiers.DisableTormentCheck, &global_config.loot_modifiers.DisableTormentCheck, false},
                 {"gui.loot_suppress_gift", "Suppress gift generation", "##loot_suppress_gift", &cfg.loot_modifiers.SuppressGiftGeneration, &global_config.loot_modifiers.SuppressGiftGeneration, false},
+                {"gui.loot_ethereal_primal", "Ethereals always primal", "##loot_ethereal_primal", &cfg.loot_modifiers.EtherealAlwaysPrimal, &global_config.loot_modifiers.EtherealAlwaysPrimal, false},
             }};
 
             mark_dirty(render_filter_and_bulk(overlay_.tr("gui.filter_loot", "Filter"), "##loot_filter", loot_filter, rows, false));
