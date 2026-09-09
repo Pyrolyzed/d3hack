@@ -4785,6 +4785,244 @@ namespace d3 {
     inline bool s_bMomWantRefresh = false;
     inline u32  s_uMomActorId     = 0;   // captured where it is VALID
 
+    // d3hack-custom: teach the game that a skill of your choosing IS a Primary skill.
+    //
+    // WHY THIS EXISTS. Kridershot makes Elemental Arrow GENERATE Hatred, but the skill is still
+    // filed as a Secondary, and all three Gears of Dreadlands bonuses are written against "a
+    // Primary skill" -- the 2pc Momentum grant, the 4pc Strafe auto-fire of your last primary,
+    // and the 6pc damage multiplier. So the bow and the set cannot be used together at all.
+    //
+    // HOW THE TARGET WAS FOUND. None of this is guessable, so it is written down:
+    //   1. .rodata carries the power-tag NAME table; one entry is "TAG_POWER_IS_PRIMARY" at
+    //      0xE436EA. The DiIiS PowerKeys.cs table gives that tag key 327776 = 0x50060. Its
+    //      ScriptFormula0 = 266496 = 0x41100 is exactly the key base this file derived
+    //      independently from 0x9B7F50, so the two numberings are the same table.
+    //   2. .text materialises 0x50060 in exactly TWO places: 0x7317B8 and 0x7318AC.
+    //   3. The function around the second starts at 0x731800, and the script-binding table at
+    //      0xD68950 NAMES it: "PowerIsPrimary", script wrapper 0x8DFF80 -> native 0x731800,
+    //      taking (w0 = power SNO, w1 = rune index) and returning 0 or 1.
+    //
+    // Step 3 is the whole point. Set bonuses are power SCRIPTS -- the recorded Momentum grant
+    // stack runs through the Lua VM (the B2xxxx frames) -- and a script asking "was that a
+    // primary?" has exactly one function it can call. This is it.
+    //
+    // THIS IS NOT A FOURTH ATTEMPT AT FAKING A CAST. The three dead ends above (relabel w3,
+    // inject a synthetic call, force the verdict) all tried to make the game believe a primary
+    // was fired. This changes the ANSWER to a question the game asks about a real Elemental
+    // Arrow that the player really fired and that really hit. Nothing is synthesised.
+    //
+    // ADDITIVE, never subtractive: Orig() runs first and a stock "yes" is never turned into a
+    // "no". It is a TRAMPOLINE rather than an early-out on purpose -- every exit of 0x731800
+    // converges on 0x731874, which RELEASES the power record fetched at 0x73182C, so returning
+    // early would leak one record per query.
+    //
+    // !! MEASURED 2026-09-08: THIS IS NOT THE GEARS OF DREADLANDS GATE. !!
+    //
+    // 0x731800 resolves the power's script TEMPLATE (tag 0x50000, PowerKeys `Template`)
+    // through 0x7308E0 and answers 1 outright for templates {3,6,30,40,41}. In game it
+    // returned stock 1 for DemonHunter_Strafe (134030), Multishot (77649), Axe_Operate_Gizmo
+    // (30021) AND Elemental Arrow (131325), and 0 only for passives (208610). So it means
+    // "this power's template can act as a primary attack", not "this is a Primary-category
+    // skill", and the override never fires -- EA already reads 1. Kept, armed and harmless,
+    // because it is additive and costs one compare; it is NOT the fix.
+    //
+    // The SkillKit category was checked too and is also a dead end: 0x6F0440(kitSno, powerSno)
+    // returns the ActiveSkillEntry whose +4 is ActiveSkillCategory (HatredGenerator = 9 is the
+    // DH Primary tab), and all five of its callers want a required LEVEL from +0xC. Nothing in
+    // gameplay code reads the category at all -- it is a skill-UI grouping.
+    //
+    // The live lead is SkillGateProbe below.
+    inline constexpr uintptr_t kPowerIsPrimaryOffset = 0x731800;
+
+    inline constexpr int kForcedPrimaryMax = 16;
+    inline s32           s_arForcedPrimary[kForcedPrimaryMax] = {};
+    inline int           s_nForcedPrimary = -1;  // -1 = not parsed yet
+
+    // Parsed from PrimarySkillPowerSnos, comma-separated decimal power SNOs. Forced at install
+    // time so the hook callback only ever reads the array.
+    inline void ParseForcedPrimaryList() {
+        if (s_nForcedPrimary >= 0)
+            return;
+        s_nForcedPrimary  = 0;
+        const auto &sList = global_config.rare_cheats.primary_skill_power_snos;
+        size_t      i     = 0;
+        while (i < sList.size() && s_nForcedPrimary < kForcedPrimaryMax) {
+            while (i < sList.size() && (sList[i] < '0' || sList[i] > '9'))
+                ++i;
+            s32  v    = 0;
+            bool bAny = false;
+            while (i < sList.size() && sList[i] >= '0' && sList[i] <= '9') {
+                v = v * 10 + static_cast<s32>(sList[i] - '0');
+                ++i;
+                bAny = true;
+            }
+            if (bAny && v > 0)
+                s_arForcedPrimary[s_nForcedPrimary++] = v;
+        }
+    }
+
+    inline auto ForcedPrimaryCount() -> int {
+        ParseForcedPrimaryList();
+        return s_nForcedPrimary;
+    }
+
+    inline auto IsForcedPrimaryPower(s32 nSno) -> bool {
+        for (int i = 0; i < s_nForcedPrimary; ++i)
+            if (s_arForcedPrimary[i] == nSno)
+                return true;
+        return false;
+    }
+
+    // d3hack-custom: WHAT does the set give a primary that it does not give Elemental Arrow?
+    //
+    // Run 3 settled that the question is not asked through the power tags: the Hungering Arrow
+    // and Elemental Arrow records were read with the SAME keys and the SAME values (Template 6,
+    // IsOffensive 1 on both), so the gate is not a tag comparison and the tag-read probe has
+    // nothing left to say.
+    //
+    // What is still unexamined is the OUTPUT side. Both halves of the set land as per-power
+    // attributes: the 6pc "your Primary skills deal 10,000% increased damage" has to be written
+    // somewhere keyed by skill, and the 2pc grant already is (Momentum is BUFF_ICON_COUNT10 on
+    // power 484289, found on this very hook). So instead of hunting the test, log every
+    // attribute write whose PARAMETER is one of a watched set of power SNOs. Fire Hungering
+    // Arrow, then Elemental Arrow: the attributes present for one and missing for the other are
+    // exactly what has to be mirrored, and the caller that writes them IS the gate.
+    //
+    // This rides the id-setter hook that is already installed (w1 packs attr | param << 12), so
+    // it costs one AND and one compare per write and adds no new hook.
+    inline constexpr int kSkillAttrWatchMax = 8;
+    inline s32           s_arSkillAttrWatch[kSkillAttrWatchMax] = {};
+    inline int           s_nSkillAttrWatch = -1;
+
+    inline void ParseSkillAttrWatch() {
+        if (s_nSkillAttrWatch >= 0)
+            return;
+        s_nSkillAttrWatch = 0;
+        const auto &sList = global_config.rare_cheats.skill_attr_probe_snos;
+        size_t      i     = 0;
+        while (i < sList.size() && s_nSkillAttrWatch < kSkillAttrWatchMax) {
+            while (i < sList.size() && (sList[i] < '0' || sList[i] > '9'))
+                ++i;
+            s32  v    = 0;
+            bool bAny = false;
+            while (i < sList.size() && sList[i] >= '0' && sList[i] <= '9') {
+                v = v * 10 + static_cast<s32>(sList[i] - '0');
+                ++i;
+                bAny = true;
+            }
+            if (bAny && v > 0)
+                s_arSkillAttrWatch[s_nSkillAttrWatch++] = v;
+        }
+    }
+
+    inline auto SkillAttrWatchCount() -> int {
+        ParseSkillAttrWatch();
+        return s_nSkillAttrWatch;
+    }
+
+    inline auto IsSkillAttrWatched(s32 nSno) -> bool {
+        for (int i = 0; i < s_nSkillAttrWatch; ++i)
+            if (s_arSkillAttrWatch[i] == nSno)
+                return true;
+        return false;
+    }
+
+    // Distinct (attr, power, value) -- a repeated identical write says nothing, but a value
+    // CHANGE does, so the value is part of the key rather than filtered out.
+    inline void SkillAttrReport(s32 nAttr, s32 nPower, u32 uVal, u64 uFrom) {
+        struct Seen {
+            s32 attr;
+            s32 pw;
+            u32 val;
+        };
+        static Seen s_ar[256] {};
+        static int  s_n = 0;
+        for (int i = 0; i < s_n; ++i)
+            if (s_ar[i].attr == nAttr && s_ar[i].pw == nPower && s_ar[i].val == uVal)
+                return;
+        if (s_n >= 256)
+            return;
+        s_ar[s_n].attr = nAttr;
+        s_ar[s_n].pw   = nPower;
+        s_ar[s_n].val  = uVal;
+        ++s_n;
+        float flAs = 0.0f;
+        __builtin_memcpy(&flAs, &uVal, 4);
+        PRINT("[d3hack-skillattr] power %d attr 0x%03X = %d (as float %d/1000) from +0x%lX",
+              static_cast<int>(nPower), static_cast<unsigned>(nAttr), static_cast<int>(uVal),
+              static_cast<int>(flAs * 1000.0f), uFrom)
+    }
+
+    HOOK_DEFINE_TRAMPOLINE(PowerIsPrimaryOverride) {
+        static auto Callback(s32 nPowerSno, s32 nRune) -> s32 {
+            const s32 nStock = Orig(nPowerSno, nRune);
+            const s32 nOut   = (nStock == 0 && IsForcedPrimaryPower(nPowerSno)) ? 1 : nStock;
+
+            if (global_config.rare_cheats.power_is_primary_probe) {
+                // DEDUP INCLUDES THE CALLER. Run 1 keyed on (sno, rune) alone, so the
+                // second caller of an already-seen pair printed nothing -- and "who else asks
+                // this" was the whole question. Never dedup a caller-hunting probe on its
+                // arguments only.
+                struct Seen {
+                    s32 sno;
+                    s32 rune;
+                    u64 from;
+                };
+                static Seen s_ar[96] {};
+                static int  s_n  = 0;
+                // __builtin_return_address(0) is the REAL caller inside a trampoline callback --
+                // it is the exlaunch stub only in an INLINE hook, see the correction in
+                // HANDOFF.md.
+                const u64 uRet =
+                    reinterpret_cast<u64>(__builtin_return_address(0)) - GameOffset(0);
+                bool bNew = true;
+                for (int i = 0; i < s_n; ++i)
+                    if (s_ar[i].sno == nPowerSno && s_ar[i].rune == nRune && s_ar[i].from == uRet)
+                        bNew = false;
+                if (bNew && s_n < 96) {
+                    s_ar[s_n].sno  = nPowerSno;
+                    s_ar[s_n].rune = nRune;
+                    s_ar[s_n].from = uRet;
+                    ++s_n;
+                    NamePowerOnce(nPowerSno);
+                    PRINT("[d3hack-primary] ask sno %d rune %d -> stock %d, answered %d "
+                          "(caller +0x%lX)",
+                          static_cast<int>(nPowerSno), static_cast<int>(nRune),
+                          static_cast<int>(nStock), static_cast<int>(nOut), uRet)
+                }
+            }
+
+            // d3hack-custom: WHO re-fires the stand-in?
+            //
+            // Measured: with the script swap on, the 4pc auto-fires Hungering Arrow during
+            // Strafe, and it does NOT come through the player cast pipeline -- the reversed
+            // execution swap at 0x852424 logged neither a hit nor a miss across a whole session,
+            // and a miss prints whenever w20 equals the from-SNO. So the set casts by some other
+            // route. PowerIsPrimary IS asked about the stand-in on that route, so walking the
+            // stack from here names the whole chain in one run instead of another guess.
+            //
+            // Trampoline callback, so __builtin_frame_address(0) is a real frame -- the
+            // exlaunch-stub caveat applies to INLINE hooks only. Chain-hashed, so a repeated
+            // chain prints once and world setup cannot crowd out the combat chain.
+            if (global_config.rare_cheats.power_is_primary_probe &&
+                nPowerSno == global_config.rare_cheats.primary_trace_sno &&
+                global_config.rare_cheats.primary_trace_sno > 0) {
+                WalkStackOnce("PowerIsPrimary(trace)",
+                              reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
+            }
+
+            if (nOut != nStock) {
+                static int s_nFlip = 0;
+                if (s_nFlip < 12) {
+                    ++s_nFlip;
+                    PRINT("[d3hack-primary] FORCED PRIMARY #%d: sno %d rune %d  0 -> 1", s_nFlip,
+                          static_cast<int>(nPowerSno), static_cast<int>(nRune))
+                }
+            }
+            return nOut;
+        }
+    };
+
     // d3hack-custom: WHICH powers actually reach the grant block?
     //
     // 0x8565CC is the block that ends in `bl 0x8522E0`. Reaching it means the grant path runs.
@@ -5165,6 +5403,15 @@ namespace d3 {
     HOOK_DEFINE_INLINE(BuffStackProbeId) {
         static void Callback(exl::hook::InlineCtx *ctx) {
             const s32 nAttrEarly = static_cast<s32>(ctx->W[1]) & 0xFFF;
+
+            // d3hack-custom: per-skill attribute watch. Own flag; log only.
+            if (global_config.rare_cheats.skill_attr_probe) {
+                const s32 nParam = static_cast<s32>(static_cast<s32>(ctx->W[1]) >> 12);
+                if (IsSkillAttrWatched(nParam))
+                    SkillAttrReport(nAttrEarly, nParam, static_cast<u32>(ctx->W[2]),
+                                    static_cast<u64>(ctx->X[30]) -
+                                        exl::util::modules::GetTargetStart());
+            }
 
             // d3hack-custom: the Greater Rift progress bar, on the generic setter.
             //
@@ -7358,6 +7605,849 @@ namespace d3 {
         PRINT("[d3hack-power] Community_Buff_NestingPortalSpawn (Vision of Enmity) sno = %d",
               static_cast<int>(GlobalSNOGet(static_cast<SNO>(0x61B))))
     }
+
+    // d3hack-custom: WHAT does the set script actually ask when a power is used?
+    //
+    // Two candidates are eliminated by measurement, see the PowerIsPrimaryOverride comment:
+    // PowerIsPrimary (0x731800) answers 1 for Strafe and Elemental Arrow alike, and the SkillKit
+    // category is read by nothing outside the skill UI. So the Gears of Dreadlands "was that a
+    // Primary skill" test is somewhere else, and guessing has now cost one run.
+    //
+    // The grant path is already mapped and is ONE SYNCHRONOUS CALL:
+    //
+    //     0x852424  bl 0x9A4400   -> listener broadcast -> Lua VM -> buff write at 0x69EDB8
+    //
+    // So bracket exactly that call and log every power-tag key read inside it. Fire a REAL
+    // primary once and Elemental Arrow once: the key whose read differs between the two IS the
+    // gate, and PowerKeys.cs names it in one grep.
+    //
+    // Arming is two INLINE hooks at instruction boundaries that are already known good --
+    // 0x852424 is the `bl` (MomentumGrantReach sat there and fired) and 0x852428 is the recorded
+    // return address, frame [12] of the grant stack. No ABI is guessed anywhere.
+    //
+    // The two tag accessors are declared u64 -> u64 so the return is passed through whole. They
+    // are hot; everything is behind SkillGateProbe and the callbacks do one bool test when the
+    // window is closed. TURN IT OFF when the answer is in.
+    inline int s_nGateDepth = 0;
+    inline int s_nGateEvent = 0;
+
+    inline auto GateArmed() -> bool { return s_nGateDepth > 0; }
+
+    // THE TAGMAP POINTER IS PART OF THE RECORD, and run 2 proved why.
+    //
+    // 0x75E6A0's first argument is a TAGMAP, not a power SNO, so a key logged without it cannot
+    // be attributed to a power. Run 2's diff said Elemental Arrow's `Template` was 25 while
+    // PowerIsPrimary independently proved it is in {3,6,30,40,41} -- both cannot be true, and
+    // the reason is that the two reads were of DIFFERENT powers' tagmaps inside one window.
+    //
+    // Logging the pointer fixes attribution without needing a sno: the used power's tagmap is
+    // the one that appears in the Hungering Arrow event and NOT in the Elemental Arrow event
+    // (and vice versa). Everything read from a pointer common to both is the set's own machinery
+    // and can be ignored.
+    inline void GateLogKey(const void *pMap, u32 uKey, u64 uVal, char cKind) {
+        struct Seen {
+            int  ev;
+            u32  map;
+            u32  key;
+            char kind;
+        };
+        static Seen s_ar[2048] {};
+        static int  s_n = 0;
+        const int   ev  = (s_nGateEvent <= 8) ? s_nGateEvent : 99;
+        const u32   uMp = static_cast<u32>(reinterpret_cast<uintptr_t>(pMap));
+        for (int i = 0; i < s_n; ++i)
+            if (s_ar[i].ev == ev && s_ar[i].map == uMp && s_ar[i].key == uKey &&
+                s_ar[i].kind == cKind)
+                return;
+        if (s_n >= 2048)
+            return;
+        s_ar[s_n].ev   = ev;
+        s_ar[s_n].map  = uMp;
+        s_ar[s_n].key  = uKey;
+        s_ar[s_n].kind = cKind;
+        ++s_n;
+        PRINT("[d3hack-gate] ev%d map %08X %c key %u (0x%X) = %d", ev, uMp, cKind,
+              static_cast<unsigned>(uKey), static_cast<unsigned>(uKey), static_cast<int>(uVal))
+    }
+
+    // d3hack-custom: MAKE ELEMENTAL ARROW COUNT AS A PRIMARY, at the one place that decides.
+    //
+    // Four readable candidates for the Gears of Dreadlands "was that a Primary skill" test were
+    // eliminated by measurement (see the PowerIsPrimaryOverride comment and HANDOFF.md). What is
+    // left is a list compiled into the 2pc script's bytecode, which cannot be read -- the same
+    // wall as the Vision of Enmity proc chance, where the accepted answer was to change the
+    // INPUT rather than read the script. This is that.
+    //
+    // The power-used event is raised at 0x852424 as `bl 0x9A4400` with x0 = a struct built on
+    // this frame at sp+0x18. Its construction is right above:
+    //
+    //     0x8523B8  stp w23, w23, [sp, #0x18]    -> struct +0 / +4   (an actor handle)
+    //     0x8523BC  str w20, [sp, #0x20]         -> struct +8        = THE POWER SNO
+    //
+    // and run 3 confirmed w20 by observation: event #3 carried 129215 (Hungering Arrow, the cast
+    // that granted Momentum) and event #4 carried 131325 (Elemental Arrow, which granted
+    // nothing). So the listener is told which power was used through that field, and rewriting
+    // it for the duration of that ONE call makes the set script see a primary.
+    //
+    // THIS IS NOT A FOURTH ATTEMPT AT FAKING A CAST. The three burned dead ends (relabel a Strafe
+    // tick's w3, inject a synthetic 0x856080 call, force the cast verdict) all tried to make the
+    // game BELIEVE a primary was fired, and all three died at the cast verdict before the event
+    // was ever raised. Here the cast is real, the projectile is real, the hit is real and the
+    // verdict is already 0 -- run 3 logged `EVENT #4 power 131325 (verdict w3=0)`. Only the label
+    // on the notification changes, and only until the call returns.
+    //
+    // SAFETY:
+    // - Only words that EXACTLY equal the configured SNO are touched, within 0x60 bytes of a
+    //   0xF0-byte frame, so nothing else can be hit and the scan cannot run off the frame.
+    // - Every write is saved and restored at 0x852428, the instruction after the call, so no
+    //   consumer downstream of the broadcast ever sees the substitution.
+    // - Depth-counted: a listener that casts another power re-enters this site, and only the
+    //   outermost entry substitutes.
+    // - If it matches nothing it says so. Silence must never be mistakable for "it worked".
+    inline constexpr int kImpersonateScanWords = 24;   // 0x60 bytes of a 0xF0 frame
+    inline constexpr int kImpersonateMaxHits   = 8;
+
+    inline int s_nImpersonateDepth = 0;
+    inline int s_nImpersonateHeld  = 0;
+    inline s32 *s_apImpersonateAt[kImpersonateMaxHits] = {};
+
+    // !! 0x852424 IS NOT A NOTIFICATION. MEASURED THE HARD WAY, 2026-09-08. !!
+    //
+    // PrimaryEventImpersonate below rewrote the power SNO in the event payload at struct+8 and
+    // the game FIRED HUNGERING ARROW INSTEAD OF ELEMENTAL ARROW. So that field is the execution
+    // target, not a label, and the "power used event" at 0x852424 is the dispatch that runs the
+    // power. It is shipped disarmed (both keys 0) and must stay that way.
+    //
+    // The layer that IS safe is one call deeper. The listener that leads to the Momentum grant
+    // is 0x9B1AF0 (funcstart of frame [9] 0x9B1C80 in the recorded grant stack). It builds a
+    // local block at x29-0xE0 and hands it to the script VM:
+    //
+    //     0x9B1C70  sub x2, x29, #0xe0     <- the script's own copy of the event
+    //     0x9B1C74  mov w3, #4
+    //     0x9B1C78  mov x0, x19            <- the power context whose script is about to run
+    //     0x9B1C7C  bl  0x9AF460           <- run the script
+    //     0x9B1C80  ...                    <- returns here
+    //
+    // The projectile has already been dispatched by the time this runs, so changing what the
+    // SCRIPT reads cannot change what was fired. But before writing anything there, the layout
+    // has to be measured: this probe only reports WHERE a watched SNO appears in that block.
+    // Read-only, own flag. No writes, no behaviour change.
+    // d3hack-custom: THE FIX. Present Elemental Arrow to the set's SCRIPT as a primary.
+    //
+    // Measured 2026-09-08 by ScriptEventProbe, on this exact build:
+    //
+    //     #1 #2  block carries power 129215 at +0x54 and +0xD8   (Hungering Arrow -- granted)
+    //     #3 #4  block carries power 131325 at +0x54 and +0xD8   (Elemental Arrow -- refused)
+    //
+    // Same two offsets for both skills, and the Elemental Arrow cast DOES reach the script. So
+    // the script runs, reads that word, and declines. Rewrite it and it grants.
+    //
+    // WHY THIS IS SAFE AND 0x852424 WAS NOT. Rewriting the payload at 0x852424 made the game
+    // fire Hungering Arrow instead of Elemental Arrow, because that field is the execution
+    // target. This block is the script VM's own copy, built by the listener at 0x9B1AF0 and
+    // handed to 0x9AF460 AFTER the projectile has been dispatched. Nothing downstream of the
+    // script reads it, and it is restored at 0x9B1C80 the instant the script returns.
+    //
+    // TWO CONTEXTS PER CAST. The probe saw two distinct ctx x0 values for every attack, so two
+    // scripts run per attack and both are given the swapped value. If that turns out to make the
+    // 4pc auto-fire the stand-in skill during Strafe, narrow it by ctx -- the swap logs its ctx
+    // pointer for exactly that reason.
+    inline constexpr int kScriptSwapWords = 56;  // 0xE0 bytes, the block size at 0x9B1C70
+    inline constexpr int kScriptSwapMax   = 8;
+
+    inline int  s_nScriptSwapDepth = 0;
+    inline int  s_nScriptSwapHeld  = 0;
+    inline s32 *s_apScriptSwapAt[kScriptSwapMax]  = {};
+    // With a LIST of promoted skills the restore cannot just write the configured "from" value
+    // back -- different slots may have held different SNOs. Save each original.
+    inline s32  s_arScriptSwapOld[kScriptSwapMax] = {};
+
+    // d3hack-custom: make the 4pc re-fire Elemental Arrow instead of the stand-in.
+    //
+    // TRACED, not guessed. With the script swap on, the set records the stand-in as "your last
+    // used primary" and Strafe re-fires IT. WalkStack from PowerIsPrimary named the whole chain:
+    //
+    //     [0] 9D5860  [1] 9D5628  [2] 8E1CD4  [3..7] B2xxxx (the Lua VM)  [9] 9AF750 ...
+    //
+    // 0x8E1CD4 is inside the script binding **PowerStartPower** (native 0x8E1210, named by the
+    // binding table at 0xD68DB8), and the instruction before it is
+    //
+    //     0x8E1CD0  bl 0x9D5580     with w0=w23, w1=w24, x2, w3=w21, w4=w22, w5, + stack args
+    //
+    // where w23/w24 are the script's first two arguments (fcvtzs from d8/d9). That is the set
+    // launching a power from script -- not the player's cast pipeline, which is why the 0x852424
+    // swap never saw it.
+    //
+    // INLINE, NOT A TRAMPOLINE. 0x9D5580 reads stack-passed arguments at [x29+0x10] and
+    // [x29+0x18]; a trampoline forwarding only register args would rebuild the frame and hand it
+    // garbage. Editing the registers in place at the call site avoids reconstructing the ABI at
+    // all -- the same reason every other hook in this file that touches arguments is inline.
+    //
+    // Exact matches only, and no restore: this IS the start of the power, so the swap is the
+    // point. Only a register that exactly equals the configured from-SNO is touched; actor
+    // handles live around 0x78xxxxxx and cannot collide with a power SNO.
+    HOOK_DEFINE_INLINE(StartPowerSwap) {
+        static void Callback(exl::hook::InlineCtx *ctx) {
+            const s32 nFrom = global_config.rare_cheats.start_power_swap_sno;
+            const s32 nTo   = global_config.rare_cheats.start_power_swap_as_sno;
+            if (nFrom <= 0 || nTo <= 0)
+                return;
+            // Constant indices only. A runtime index into ctx->W trips -Warray-bounds on
+            // exl::hook::nx64::GpRegisters::m_Gp, and this project builds warnings as errors.
+            //
+            // MEASURED: the SNO is in NONE of these. A run logged, four times,
+            //     w0=2018836632 w1=2069300064 w3=0 w4=1 w5=-1
+            // where w0 is the caster handle and w1 the target handle. Kept because it costs two
+            // compares and would catch a variant call shape, but the NAME swap below is what
+            // actually does the work.
+            const u64 uTo  = static_cast<u64>(static_cast<u32>(nTo));
+            int       nHit = 0;
+            if (static_cast<s32>(ctx->W[0]) == nFrom) { ctx->W[0] = uTo; ++nHit; }
+            if (static_cast<s32>(ctx->W[1]) == nFrom) { ctx->W[1] = uTo; ++nHit; }
+            if (static_cast<s32>(ctx->W[3]) == nFrom) { ctx->W[3] = uTo; ++nHit; }
+            if (static_cast<s32>(ctx->W[4]) == nFrom) { ctx->W[4] = uTo; ++nHit; }
+            if (static_cast<s32>(ctx->W[5]) == nFrom) { ctx->W[5] = uTo; ++nHit; }
+            static int s_nLog = 0;
+            if (nHit > 0 && s_nLog < 8) {
+                ++s_nLog;
+                PRINT("[d3hack-primary] START POWER SWAP #%d: %d -> %d (%d reg)", s_nLog,
+                      static_cast<int>(nFrom), static_cast<int>(nTo), nHit)
+            }
+        }
+    };
+
+    // d3hack-custom: PowerStartPower takes the power as a NAME, not an SNO.
+    //
+    // 0x8E13D0 / 0x8E14B4 / 0x8E15BC each do `bl 0xB1A3A0` with w1 = 3 and put the result in
+    // x20, which is what becomes x2 at the 0x8E1CD0 call. 0xB1A3A0 is the script VM fetching
+    // argument 3 as a STRING. That is exactly why the SNO swap matched nothing in any register.
+    //
+    // So swap the POINTER: if the incoming name is the configured one, aim x2 at our own static
+    // copy of the replacement. The game's string is never written to -- only the register moves
+    // -- so anything else holding that pointer is untouched.
+    //
+    // Self-diagnosing: every distinct name that arrives here is logged once. If the set asks for
+    // something other than the expected name, the log says what it is and the correction is a
+    // config value rather than another build.
+    inline char s_szStartPowerTo[64] = {};
+
+    inline auto SafeGuestString(const void *p, char *pOut, int nCap) -> bool {
+        const auto u = reinterpret_cast<uintptr_t>(p);
+        if (u < 0x1000ull)
+            return false;
+        const char *sz = static_cast<const char *>(p);
+        for (int i = 0; i < nCap - 1; ++i) {
+            const char c = sz[i];
+            if (c == 0) {
+                pOut[i] = 0;
+                return i > 0;
+            }
+            if (c < 0x20 || c >= 0x7F)
+                return false;
+            pOut[i] = c;
+        }
+        return false;  // no terminator in range -- not a name
+    }
+
+    // PowerStartPower has TWO calls to 0x9D5580, and only one of them was hooked.
+    //
+    //     0x8E131C   the 3-argument branch   (x2 set at 0x8E12F4, `mov x2, x0`)
+    //     0x8E1CD0   the 4-argument branch   (x2 set at 0x8E1CBC, `mov x2, x20`)
+    //
+    // Both take the power name in x2 -- each is preceded by `bl 0xB1A3A0` fetching argument 3 as
+    // a string. The first build hooked only 0x8E1CD0/0x8E1CCC, which fired for something else
+    // entirely and never for the 4pc re-fire. The body is shared and installed at both, because
+    // "I hooked the call site" is only true if you hooked ALL of them -- a function with two
+    // exits needs two hooks, and this cost a run to learn.
+    //
+    // Two thin classes rather than one installed twice: HOOK_DEFINE_INLINE keeps its trampoline
+    // in class-static storage, so installing the same class at two addresses would clobber it.
+    inline void StartPowerNameSwapBody(exl::hook::InlineCtx *ctx, int nSite) {
+            // !! RAW DUMP FIRST, BEFORE ANY VALIDATION. !!
+            //
+            // The previous version logged the name only AFTER SafeGuestString accepted x2, so
+            // when x2 turned out not to be a string the hook produced NOTHING -- indistinguish-
+            // able from "never installed". It had installed and it had run. A probe whose only
+            // output is behind its own success test cannot report its own failure; put the
+            // unconditional line first. This is the third time this shape has cost a run.
+            {
+                static int s_arRaw[3] = {};
+                const int  nSlot      = (nSite == 1) ? 1 : 2;
+                if (s_arRaw[nSlot] < 5) {
+                    ++s_arRaw[nSlot];
+                    const auto u = static_cast<uintptr_t>(ctx->X[2]);
+                    if (u >= 0x1000ull) {
+                        const u8 *p = reinterpret_cast<const u8 *>(u);
+                        PRINT("[d3hack-primary] START POWER site %d raw x2=%p [%02X %02X "
+                              "%02X %02X %02X %02X %02X %02X] w0=%d w1=%d",
+                              nSite, reinterpret_cast<const void *>(p), p[0], p[1], p[2],
+                              p[3], p[4], p[5], p[6], p[7], static_cast<int>(ctx->W[0]),
+                              static_cast<int>(ctx->W[1]))
+                    } else {
+                        PRINT("[d3hack-primary] START POWER site %d raw x2=%p (not a pointer)",
+                              nSite, reinterpret_cast<const void *>(u))
+                    }
+                }
+            }
+
+            const auto &sFrom = global_config.rare_cheats.start_power_swap_from_name;
+            if (sFrom.empty() || s_szStartPowerTo[0] == 0)
+                return;
+
+            char szName[64];
+            if (!SafeGuestString(reinterpret_cast<const void *>(ctx->X[2]), szName, sizeof(szName)))
+                return;
+
+            {
+                static char s_arSeen[16][64] = {};
+                static int  s_nSeen          = 0;
+                bool        bNew             = true;
+                for (int i = 0; i < s_nSeen; ++i)
+                    if (__builtin_strcmp(s_arSeen[i], szName) == 0)
+                        bNew = false;
+                if (bNew && s_nSeen < 16) {
+                    __builtin_memcpy(s_arSeen[s_nSeen], szName, sizeof(szName));
+                    ++s_nSeen;
+                    PRINT("[d3hack-primary] START POWER site %d name=%s", nSite, szName)
+                }
+            }
+
+            if (__builtin_strcmp(szName, sFrom.c_str()) != 0)
+                return;
+            ctx->X[2] = reinterpret_cast<u64>(s_szStartPowerTo);
+
+            static int s_nSwap = 0;
+            if (s_nSwap < 8) {
+                ++s_nSwap;
+                PRINT("[d3hack-primary] START POWER NAME SWAP #%d (site %d): %s -> %s", s_nSwap,
+                      nSite, szName, s_szStartPowerTo)
+            }
+    }
+
+    // d3hack-custom: HOOK THE CALLEE, NOT ITS CALLERS.
+    //
+    // Four attempts were spent hooking places the set *might* start a power from, and each cost
+    // a run: the player cast pipeline (0x852424, 0 events), the SNO registers at 0x8E1CD0 (fired
+    // but the SNO is not in a register), the name at 0x8E1CCC (never fired), and both
+    // PowerStartPower call sites at once (never fired -- so PowerStartPower is not the route
+    // at all, and the earlier stack trace through it was some other cast).
+    //
+    // Both PowerStartPower branches call **0x9D5580**, and frame [1] of the recorded trace
+    // (0x9D5628) is inside it. Hooking that function's ENTRY covers every caller there is,
+    // whichever one the 4pc actually uses. That is what should have been done first: a function
+    // with N callers needs one hook at the callee, not N hooks at the callers.
+    //
+    // Entry is `sub sp, sp, #0xa0`, a clean prologue. x2 is the power name at both known call
+    // sites (`mov x2, x0` at 0x8E12F4, `mov x2, x20` at 0x8E1CBC, each right after the script VM
+    // fetches argument 3 as a string).
+    //
+    // Raw dump FIRST, unconditionally, before any validation -- a probe whose only output sits
+    // behind its own success test cannot report its own failure, and that has now cost two runs
+    // in this feature alone.
+    // 0x9D5650 IS PROVEN LIVE DURING THE 4pc AUTO-FIRE, and that is why it is hooked.
+    //
+    // Every Strafe re-fire logs `ask sno 129215 ... (caller +0x9D5860)` from the PowerIsPrimary
+    // probe. 0x9D585C is `bl 0x731800` fed by `mov w0, w25`, so w25 is the power, and w25 comes
+    // from `mov x25, x2` at 0x9D569C -- argument 2 at entry, the same register that carries the
+    // power NAME at both PowerStartPower call sites. Later, 0x9D57C0 reloads w25 from [sp+0x14]
+    // as the resolved SNO.
+    //
+    // So this is not another guess at a plausible call site: it is the function the auto-fire
+    // demonstrably runs through, hooked at its entry where the name is still an argument.
+    // 0x9D5580 is kept as a second site because both PowerStartPower branches call it; they are
+    // separate functions (prologues `sub sp,#0xa0` and `sub sp,#0x120`) at non-adjacent
+    // addresses, so there is no hook collision.
+    inline void StartPowerCalleeBody(exl::hook::InlineCtx *ctx, int nSite) {
+            {
+                static int s_arRaw[3] = {};
+                const int  nSlot      = (nSite == 1) ? 1 : 2;
+                if (s_arRaw[nSlot] < 8) {
+                    ++s_arRaw[nSlot];
+                    const auto u = static_cast<uintptr_t>(ctx->X[2]);
+                    if (u >= 0x1000ull) {
+                        const u8 *p = reinterpret_cast<const u8 *>(u);
+                        PRINT("[d3hack-primary] CALLEE site %d x2=%p [%02X %02X %02X %02X %02X "
+                              "%02X %02X %02X] w0=%d w1=%d",
+                              nSite, reinterpret_cast<const void *>(p), p[0], p[1], p[2],
+                              p[3], p[4], p[5], p[6], p[7], static_cast<int>(ctx->W[0]),
+                              static_cast<int>(ctx->W[1]))
+                    } else {
+                        PRINT("[d3hack-primary] CALLEE site %d x2=%p (not a pointer)", nSite,
+                              reinterpret_cast<const void *>(u))
+                    }
+                }
+            }
+
+            const auto &sFrom = global_config.rare_cheats.start_power_swap_from_name;
+            if (sFrom.empty() || s_szStartPowerTo[0] == 0)
+                return;
+
+            char szName[64];
+            if (!SafeGuestString(reinterpret_cast<const void *>(ctx->X[2]), szName, sizeof(szName)))
+                return;
+
+            {
+                static char s_arSeen[24][64] = {};
+                static int  s_nSeen          = 0;
+                bool        bNew             = true;
+                for (int i = 0; i < s_nSeen; ++i)
+                    if (__builtin_strcmp(s_arSeen[i], szName) == 0)
+                        bNew = false;
+                if (bNew && s_nSeen < 24) {
+                    __builtin_memcpy(s_arSeen[s_nSeen], szName, sizeof(szName));
+                    ++s_nSeen;
+                    PRINT("[d3hack-primary] CALLEE site %d name=%s", nSite, szName)
+                }
+            }
+
+            if (__builtin_strcmp(szName, sFrom.c_str()) != 0)
+                return;
+            ctx->X[2] = reinterpret_cast<u64>(s_szStartPowerTo);
+
+            static int s_nSwap = 0;
+            if (s_nSwap < 8) {
+                ++s_nSwap;
+                PRINT("[d3hack-primary] CALLEE NAME SWAP #%d (site %d): %s -> %s", s_nSwap, nSite,
+                      szName, s_szStartPowerTo)
+            }
+    }
+
+    HOOK_DEFINE_INLINE(StartPowerCallee1) {   // 0x9D5580 -- both PowerStartPower branches call it
+        static void Callback(exl::hook::InlineCtx *ctx) { StartPowerCalleeBody(ctx, 1); }
+    };
+
+    HOOK_DEFINE_INLINE(StartPowerCallee2) {   // 0x9D5650 -- PROVEN live during the 4pc re-fire
+        static void Callback(exl::hook::InlineCtx *ctx) { StartPowerCalleeBody(ctx, 2); }
+    };
+
+    HOOK_DEFINE_INLINE(StartPowerNameSwapA) {
+        static void Callback(exl::hook::InlineCtx *ctx) { StartPowerNameSwapBody(ctx, 1); }
+    };
+
+    HOOK_DEFINE_INLINE(StartPowerNameSwapB) {
+        static void Callback(exl::hook::InlineCtx *ctx) { StartPowerNameSwapBody(ctx, 2); }
+    };
+
+    // d3hack-custom: ONE LIST decides which skills are promoted to "Primary".
+    //
+    // PrimarySkillPowerSnos is the list; ScriptEventImpersonateAsSno is the real primary they are
+    // presented as. Adding Impale or Vault or anything else is a config edit -- nothing here is
+    // Elemental Arrow specific. ScriptEventImpersonateSno is still honoured so an existing
+    // single-skill config keeps working.
+    inline auto IsPromotedPrimary(s32 nSno) -> bool {
+        if (nSno <= 0)
+            return false;
+        if (nSno == global_config.rare_cheats.script_event_impersonate_sno)
+            return true;
+        return IsForcedPrimaryPower(nSno);
+    }
+
+    // d3hack-custom: THE 6pc DAMAGE GATE.
+    //
+    // The set's damage bonus has to ask "which power dealt this damage". There is exactly one
+    // native for that, and the script binding table names it: PowerBuffAppliedDamageGetPowerID,
+    // wrapper 0x90D4B0. The wrapper is four instructions --
+    //
+    //     0x90D4C0  bl 0x9D40A0      <- w0 = the damaging power SNO, or -1
+    //     0x90D4C4  scvtf d0, w0     <- handed straight to the script as a double
+    //
+    // so 0x9D40A0 IS the question, and it takes no arguments (it pulls the context from globals
+    // via 0x89D860). Answer it with the stand-in and a damage script that only pays out for
+    // primaries pays out for the promoted skill too.
+    //
+    // ADDITIVE AND NARROW: the only value ever changed is one that is explicitly in the promoted
+    // list. Everything else, including -1, passes through untouched.
+    // MEASURED 2026-09-08: 0x9D40A0 (PowerBuffAppliedDamageGetPowerID) returns a runtime
+    // INSTANCE HANDLE, not an SNO -- 32 distinct values all around 2.03e9 (0x790Fxxxx), which is
+    // the same shape as the actor handles seen elsewhere. It can never equal a power SNO, so the
+    // swap there could never fire.
+    //
+    // Its sibling PowerBuffAppliedDamageGetPower (wrapper 0x90D480) calls **0x9D4040**, which has
+    // the identical prologue but resolves the power object through 0x97D230 instead of reading a
+    // raw word -- that is the SNO path. Both are hooked now: the log prints whichever value each
+    // returns, so the next run says outright which one the 6pc actually consults, and the swap
+    // fires only on an exact match against the promoted list (a handle cannot collide with it).
+    inline auto AppliedDamageBody(s32 nReal, int nSite) -> s32 {
+        const s32 nTo = global_config.rare_cheats.script_event_impersonate_as_sno;
+
+            // Unconditional first: every distinct power that deals damage, once. If the promoted
+            // skill never appears here, this is not the damage gate and the log says so instead
+            // of going quiet.
+        {
+            static s32 s_ar[2][24] = {};
+            static int s_n[2]      = {};
+            const int  k           = (nSite == 1) ? 0 : 1;
+            bool       bNew        = true;
+            for (int i = 0; i < s_n[k]; ++i)
+                if (s_ar[k][i] == nReal)
+                    bNew = false;
+            if (bNew && s_n[k] < 24) {
+                s_ar[k][s_n[k]++] = nReal;
+                // Only name it if it could plausibly BE an sno -- NamePowerOnce on a handle
+                // just fills the log with "[sno unknown]".
+                if (nReal > 0 && nReal < 1000000)
+                    NamePowerOnce(nReal);
+                PRINT("[d3hack-primary] DAMAGE site %d power=%d", nSite, static_cast<int>(nReal))
+            }
+        }
+
+        if (nTo <= 0 || !IsPromotedPrimary(nReal))
+            return nReal;
+
+        static int s_nSwap = 0;
+        if (s_nSwap < 8) {
+            ++s_nSwap;
+            PRINT("[d3hack-primary] DAMAGE POWER SWAP #%d (site %d): %d -> %d", s_nSwap, nSite,
+                  static_cast<int>(nReal), static_cast<int>(nTo))
+        }
+        return nTo;
+    }
+
+    // d3hack-custom: WHERE IS THE 6pc MULTIPLIER STORED?
+    //
+    // Eliminated by measurement, in order:
+    //   - PowerIsPrimary (0x731800)            EA already answers 1
+    //   - SkillKit ActiveSkillCategory         read by nothing outside the skill UI
+    //   - a power-tag comparison               HA and EA answer identically on every tag
+    //   - a per-skill attribute WRITE          only buff-icon bookkeeping on the id setter
+    //   - the damaging-power query (0x9D4040)  swap fires on every EA hit, damage does not move
+    //
+    // The last one is the important negative: the 6pc is NOT gated on "which power dealt this
+    // damage". So the multiplier is a per-skill number the damage math READS, and reads were
+    // never probed -- only writes.
+    //
+    // This logs every distinct (attribute, power) pair the FLOAT attribute getter is asked for
+    // whose parameter looks like a power SNO, with its value. A 10,000% bonus cannot hide in
+    // that list. Deduped on (attr, param) and capped, so volume is bounded by how many distinct
+    // per-skill numbers exist, not by frame rate.
+    //
+    // FastAttribGetValueFloat is a FREE door: DamageBonusProbe owns it but is off, and the pet
+    // knobs hold ACD_AttributesGetFloat instead. Two trampolines on one address is the recurring
+    // bug in this file, so the install refuses if DamageBonusProbe is on.
+    HOOK_DEFINE_TRAMPOLINE(SkillAttrReadProbe) {
+        static auto Callback(FastAttribGroup *ptGroup, FastAttribKey tKey) -> float {
+            const float ret        = Orig(ptGroup, tKey);
+            const s32   nAttrEarly = static_cast<s32>(KeyGetAttrib(tKey));
+            // NOTE: the probe flag gates LOGGING ONLY, further down. The damage mirror below is
+            // a FEATURE and must not be gated on a diagnostic -- that is CLAUDE.md rule 2, and
+            // this file has lost sessions to exactly that shape.
+
+            const s32 nParam = static_cast<s32>(KeyGetParam(tKey));
+            if (nParam < 1000 || nParam > 2000000)   // not a power SNO
+                return ret;
+
+            // ---- THE 6pc DAMAGE FIX -------------------------------------------------------
+            //
+            // MEASURED 2026-09-08, firing Hungering Arrow and Elemental Arrow in the same run
+            // with the same gear:
+            //
+            //     attr 0x5A8  power 129215 HungeringArrow = 828.000
+            //     attr 0x5A8  power 131325 ElementalArrow =   1.000
+            //     attr 0x5A8  power 134030 Strafe         =   3.000
+            //
+            // Every other attribute read identically for all three. 0x5A8 is
+            // MULTIPLICATIVE_DAMAGE_PERCENT_BONUS_FOR_SKILL, and it is where the whole
+            // primary-skill multiplier lands. Elemental Arrow carries 1.0 -- no bonus at all.
+            //
+            // So mirror it: when the damage math asks for a promoted skill's multiplier, ask for
+            // the stand-in primary's instead and hand back the larger of the two. The key packs
+            // as `attr | param << 12` (d3/util.cpp KeyGetAttrib/KeyGetParam), so the stand-in's
+            // key is constructible directly -- no cache, so it works even with the stand-in skill
+            // absent from the bar.
+            //
+            // ADDITIVE: max(), never a plain replace, so a skill that already has its own
+            // multiplier keeps it if it is bigger. Orig() does not re-enter this callback, so the
+            // second read cannot recurse.
+            constexpr s32 kAttrSkillDamageMult = 0x5A8;
+            const s32     nStandIn = global_config.rare_cheats.script_event_impersonate_as_sno;
+            if (nAttrEarly == kAttrSkillDamageMult && nStandIn > 0 && nParam != nStandIn &&
+                IsPromotedPrimary(nParam)) {
+                FastAttribKey tStand;
+                tStand.nValue   = kAttrSkillDamageMult | (nStandIn << 12);
+                const float flS = Orig(ptGroup, tStand);
+                if (flS > ret) {
+                    static int s_nMirror = 0;
+                    if (s_nMirror < 8) {
+                        ++s_nMirror;
+                        PRINT("[d3hack-primary] SKILL DAMAGE MIRROR #%d: power %d attr 0x5A8 "
+                              "%d.%03d -> %d.%03d (from power %d)",
+                              s_nMirror, static_cast<int>(nParam), static_cast<int>(ret),
+                              static_cast<int>((ret < 0.0f ? -ret : ret) * 1000.0f) % 1000,
+                              static_cast<int>(flS),
+                              static_cast<int>((flS < 0.0f ? -flS : flS) * 1000.0f) % 1000,
+                              static_cast<int>(nStandIn))
+                    }
+                    return flS;
+                }
+            }
+            // -------------------------------------------------------------------------------
+            // WATCH LIST ONLY. Run 1 used a flat 96-slot budget and world setup ate every slot
+            // on 0x540/0x541/0x4AF/0x2F0 reads for ~21 unrelated powers -- all 0 or 2147483647
+            // (unset) -- so the skills being investigated never appeared at all. HANDOFF.md
+            // already warned that a flat "first N" budget gets consumed before combat starts;
+            // this is the fourth time. Key the filter on the SUBJECT, not on a counter.
+            if (!IsSkillAttrWatched(nParam))
+                return ret;
+            const s32 nAttr = nAttrEarly;
+
+            if (!global_config.rare_cheats.skill_attr_read_probe)
+                return ret;
+
+            struct Seen {
+                s32 attr;
+                s32 param;
+            };
+            static Seen s_ar[96] {};
+            static int  s_n  = 0;
+            bool        bNew = true;
+            for (int i = 0; i < s_n; ++i)
+                if (s_ar[i].attr == nAttr && s_ar[i].param == nParam)
+                    bNew = false;
+            if (!bNew || s_n >= 96)
+                return ret;
+            s_ar[s_n].attr  = nAttr;
+            s_ar[s_n].param = nParam;
+            ++s_n;
+            NamePowerOnce(nParam);
+            PRINT("[d3hack-skillread] attr 0x%03X power %d = %d.%03d",
+                  static_cast<unsigned>(nAttr), static_cast<int>(nParam),
+                  static_cast<int>(ret),
+                  static_cast<int>((ret < 0.0f ? -ret : ret) * 1000.0f) % 1000)
+            return ret;
+        }
+    };
+
+    HOOK_DEFINE_TRAMPOLINE(AppliedDamagePowerSno) {   // 0x9D4040 -- resolves through 0x97D230
+        static auto Callback() -> s32 { return AppliedDamageBody(Orig(), 1); }
+    };
+
+    HOOK_DEFINE_TRAMPOLINE(AppliedDamagePowerId) {    // 0x9D40A0 -- returns an instance handle
+        static auto Callback() -> s32 { return AppliedDamageBody(Orig(), 2); }
+    };
+
+    HOOK_DEFINE_INLINE(ScriptEventImpersonate) {
+        static void Callback(exl::hook::InlineCtx *ctx) {
+            const int nDepth = s_nScriptSwapDepth++;
+            if (nDepth != 0)
+                return;
+            s_nScriptSwapHeld = 0;
+
+            const s32 nTo = global_config.rare_cheats.script_event_impersonate_as_sno;
+            if (nTo <= 0 || (ForcedPrimaryCount() <= 0 &&
+                             global_config.rare_cheats.script_event_impersonate_sno <= 0))
+                return;
+            auto *pBlock = reinterpret_cast<s32 *>(ctx->X[2]);
+            if (pBlock == nullptr)
+                return;
+
+            // WHICH FIELDS. The probe found the attacking power at TWO offsets, +0x54 and
+            // +0xD8, and swapping both granted Momentum but also made the 4pc record the
+            // stand-in and auto-fire IT during Strafe -- measured in game 2026-09-08. The two
+            // copies are therefore not interchangeable: one is read by the "was that a primary"
+            // test and the other by "remember what to re-fire". The mask selects which
+            // occurrences, in order of appearance, get swapped:
+            //
+            //     0 = every occurrence (the original behaviour, grants but re-fires the stand-in)
+            //     1 = the 1st only        2 = the 2nd only        3 = both
+            //
+            // If the grant survives with only one bit set, the unswapped copy is what the auto-
+            // fire reads and Elemental Arrow re-fires as itself.
+            const int nMask = global_config.rare_cheats.script_event_impersonate_field_mask;
+            int       nSeen = 0;
+            for (int i = 0; i < kScriptSwapWords && s_nScriptSwapHeld < kScriptSwapMax; ++i) {
+                // List-driven, so promoting a second skill is a config edit and not a rebuild.
+                if (!IsPromotedPrimary(pBlock[i]))
+                    continue;
+                const int nIdx = nSeen++;
+                if (nMask != 0 && ((nMask >> nIdx) & 1) == 0)
+                    continue;
+                s_arScriptSwapOld[s_nScriptSwapHeld] = pBlock[i];
+                s_apScriptSwapAt[s_nScriptSwapHeld++] = &pBlock[i];
+                pBlock[i]                             = nTo;
+            }
+            if (s_nScriptSwapHeld == 0)
+                return;
+
+            static int s_nLog = 0;
+            if (s_nLog < 10) {
+                ++s_nLog;
+                PRINT("[d3hack-primary] SCRIPT SEES PRIMARY #%d: %d -> %d, %d of %d field(s) "
+                      "(mask %d), first at +0x%X, ctx x0=%p",
+                      s_nLog, static_cast<int>(s_arScriptSwapOld[0]), static_cast<int>(nTo),
+                      s_nScriptSwapHeld,
+                      nSeen, nMask,
+                      static_cast<unsigned>(reinterpret_cast<uintptr_t>(s_apScriptSwapAt[0]) -
+                                            ctx->X[2]),
+                      reinterpret_cast<void *>(ctx->X[0]))
+            }
+        }
+    };
+
+    HOOK_DEFINE_INLINE(ScriptEventRestore) {
+        static void Callback(exl::hook::InlineCtx *) {
+            if (s_nScriptSwapDepth > 0)
+                --s_nScriptSwapDepth;
+            if (s_nScriptSwapDepth != 0)
+                return;
+            for (int i = 0; i < s_nScriptSwapHeld; ++i)
+                if (s_apScriptSwapAt[i] != nullptr)
+                    *s_apScriptSwapAt[i] = s_arScriptSwapOld[i];
+            s_nScriptSwapHeld = 0;
+        }
+    };
+
+    HOOK_DEFINE_INLINE(ScriptEventProbe) {
+        static void Callback(exl::hook::InlineCtx *ctx) {
+            static int s_n = 0;
+            if (s_n >= 12)
+                return;
+            const auto *pBlock = reinterpret_cast<const s32 *>(ctx->X[2]);
+            if (pBlock == nullptr)
+                return;
+
+            // Only report a block that carries one of the watched powers, so the 12-line budget
+            // is spent on the casts that matter instead of on world setup.
+            constexpr int kWords = 56;  // 0xE0 bytes
+            int           nHits  = 0;
+            s32           nWhich = 0;
+            for (int i = 0; i < kWords; ++i)
+                if (IsSkillAttrWatched(pBlock[i])) {
+                    if (nHits == 0)
+                        nWhich = pBlock[i];
+                    ++nHits;
+                }
+            if (nHits == 0)
+                return;
+            ++s_n;
+
+            // Offsets of every watched SNO, plus the first 8 words for orientation.
+            s32 arOff[8] {};
+            int nOff = 0;
+            for (int i = 0; i < kWords && nOff < 8; ++i)
+                if (IsSkillAttrWatched(pBlock[i]))
+                    arOff[nOff++] = static_cast<s32>(i * 4);
+            PRINT("[d3hack-script] #%d block %p carries power %d at +0x%X +0x%X +0x%X +0x%X "
+                  "(ctx x0=%p, w3=%d)",
+                  s_n, reinterpret_cast<const void *>(pBlock), static_cast<int>(nWhich),
+                  static_cast<unsigned>(arOff[0]), static_cast<unsigned>(arOff[1]),
+                  static_cast<unsigned>(arOff[2]), static_cast<unsigned>(arOff[3]),
+                  reinterpret_cast<void *>(ctx->X[0]), static_cast<int>(ctx->W[3]))
+            PRINT("[d3hack-script] #%d words0-7 %08X %08X %08X %08X %08X %08X %08X %08X", s_n,
+                  static_cast<unsigned>(pBlock[0]), static_cast<unsigned>(pBlock[1]),
+                  static_cast<unsigned>(pBlock[2]), static_cast<unsigned>(pBlock[3]),
+                  static_cast<unsigned>(pBlock[4]), static_cast<unsigned>(pBlock[5]),
+                  static_cast<unsigned>(pBlock[6]), static_cast<unsigned>(pBlock[7]))
+        }
+    };
+
+    HOOK_DEFINE_INLINE(PrimaryEventImpersonate) {
+        static void Callback(exl::hook::InlineCtx *ctx) {
+            const int nDepth = s_nImpersonateDepth++;
+            if (nDepth != 0)
+                return;
+            s_nImpersonateHeld = 0;
+
+            const s32 nFrom = global_config.rare_cheats.primary_event_impersonate_sno;
+            const s32 nTo   = global_config.rare_cheats.primary_event_impersonate_as_sno;
+            if (nFrom <= 0 || nTo <= 0)
+                return;
+
+            auto *pWords = reinterpret_cast<s32 *>(ctx->X[0]);
+            if (pWords == nullptr)
+                return;
+
+            for (int i = 0; i < kImpersonateScanWords && s_nImpersonateHeld < kImpersonateMaxHits;
+                 ++i) {
+                if (pWords[i] != nFrom)
+                    continue;
+                s_apImpersonateAt[s_nImpersonateHeld++] = &pWords[i];
+                pWords[i]                               = nTo;
+            }
+
+            static int s_nLog = 0;
+            if (s_nImpersonateHeld > 0) {
+                if (s_nLog < 10) {
+                    ++s_nLog;
+                    PRINT("[d3hack-primary] EVENT IMPERSONATED #%d: power %d presented as %d "
+                          "(%d field(s), first at +0x%X)",
+                          s_nLog, static_cast<int>(nFrom), static_cast<int>(nTo),
+                          s_nImpersonateHeld,
+                          static_cast<unsigned>(reinterpret_cast<uintptr_t>(s_apImpersonateAt[0]) -
+                                                ctx->X[0]))
+                }
+            } else {
+                // A miss is a RESULT. If the SNO is not in the payload the whole idea is wrong,
+                // and that has to be visible rather than looking like the hook never ran.
+                static int s_nMiss = 0;
+                const s32  nSeen   = static_cast<s32>(ctx->W[20]);
+                if (nSeen == nFrom && s_nMiss < 6) {
+                    ++s_nMiss;
+                    PRINT("[d3hack-primary] IMPERSONATE MISS: w20 says power %d but it is not in "
+                          "the event payload -- the SNO is not at a scanned offset",
+                          static_cast<int>(nSeen))
+                }
+            }
+        }
+    };
+
+    HOOK_DEFINE_INLINE(PrimaryEventRestore) {
+        static void Callback(exl::hook::InlineCtx *) {
+            if (s_nImpersonateDepth > 0)
+                --s_nImpersonateDepth;
+            if (s_nImpersonateDepth != 0)
+                return;
+            const s32 nFrom = global_config.rare_cheats.primary_event_impersonate_sno;
+            for (int i = 0; i < s_nImpersonateHeld; ++i)
+                if (s_apImpersonateAt[i] != nullptr)
+                    *s_apImpersonateAt[i] = nFrom;
+            s_nImpersonateHeld = 0;
+        }
+    };
+
+    HOOK_DEFINE_INLINE(SkillGateArm) {
+        static void Callback(exl::hook::InlineCtx *ctx) {
+            if (s_nGateDepth == 0)
+                ++s_nGateEvent;
+            ++s_nGateDepth;
+            // w20 IS the power SNO -- measured in run 2, where event #4 carried 0x1F8BF
+            // (129215, Hungering Arrow, the event that granted Momentum) and events #2/#3
+            // carried 0x7545 (30021, Axe_Operate_Gizmo). Every event now labels itself, so no
+            // event has to be identified by its timestamp.
+            if (s_nGateDepth == 1 && s_nGateEvent <= 24) {
+                const s32 nPower = static_cast<s32>(ctx->W[20]);
+                NamePowerOnce(nPower);
+                PRINT("[d3hack-gate] EVENT #%d power %d (verdict w3=%d)", s_nGateEvent,
+                      static_cast<int>(nPower), static_cast<int>(ctx->W[3]))
+            }
+        }
+    };
+
+    HOOK_DEFINE_INLINE(SkillGateDisarm) {
+        static void Callback(exl::hook::InlineCtx *) {
+            if (s_nGateDepth > 0)
+                --s_nGateDepth;
+        }
+    };
+
+    // 0x75DFF0 -- tagmap "has key". 0x75E6A0 -- tagmap "get int". Both (x0 = tagmap, w1 = key),
+    // read straight off the call sites inside 0x731800, so neither signature is a guess.
+    HOOK_DEFINE_TRAMPOLINE(TagHasKeyGate) {
+        static auto Callback(void *pMap, u32 uKey) -> u64 {
+            const u64 r = Orig(pMap, uKey);
+            if (GateArmed())
+                GateLogKey(pMap, uKey, r, 'H');
+            return r;
+        }
+    };
+
+    HOOK_DEFINE_TRAMPOLINE(TagGetIntGate) {
+        static auto Callback(void *pMap, u32 uKey) -> u64 {
+            const u64 r = Orig(pMap, uKey);
+            if (GateArmed())
+                GateLogKey(pMap, uKey, r, 'G');
+            return r;
+        }
+    };
 
     // d3hack-custom: one line per rift so the level the game thinks you are on is
     // always in the log next to whatever the drops and gem chance did.
@@ -13589,6 +14679,131 @@ namespace d3 {
                 SetBonusAnyWeapon::InstallAtOffset(0x97B6AC);
                 PRINT_LINE("[d3hack-set] weapon-gate bypass installed at 0x97B694 / 0x97B6AC");
             }
+            // d3hack-custom: the 4pc re-fire. Traced to PowerStartPower -- see the hook.
+            // The NAME swap is the one that does the work. The SNO swap is kept for a variant
+            // call shape and is measured NOT to fire here. Separate hooks, separate addresses
+            // (0x8E1CCC and 0x8E1CD0), so both can be installed at once.
+            if (!global_config.rare_cheats.start_power_swap_from_name.empty() &&
+                !global_config.rare_cheats.start_power_swap_to_name.empty()) {
+                const auto &sTo = global_config.rare_cheats.start_power_swap_to_name;
+                __builtin_memset(s_szStartPowerTo, 0, sizeof(s_szStartPowerTo));
+                const size_t nCopy = (sTo.size() < sizeof(s_szStartPowerTo) - 1)
+                                         ? sTo.size()
+                                         : sizeof(s_szStartPowerTo) - 1;
+                __builtin_memcpy(s_szStartPowerTo, sTo.c_str(), nCopy);
+                // The CALLEE hook is the one that matters -- it catches every caller. The two
+                // call-site hooks are left out entirely now: both were measured never to fire,
+                // and keeping dead hooks armed is how this file grew its worst bugs.
+                StartPowerCallee1::InstallAtOffset(0x9D5580);
+                StartPowerCallee2::InstallAtOffset(0x9D5650);
+                PRINT("[d3hack-primary] START-POWER CALLEE swap ARMED at 0x9D5580 + 0x9D5650 "
+                      "(site 2 is the one the 4pc provably runs through): %s -> %s",
+                      global_config.rare_cheats.start_power_swap_from_name.c_str(),
+                      s_szStartPowerTo)
+            }
+            if (global_config.rare_cheats.start_power_swap_sno > 0 &&
+                global_config.rare_cheats.start_power_swap_as_sno > 0) {
+                StartPowerSwap::InstallAtOffset(0x8E1CD0);
+                PRINT("[d3hack-primary] START-POWER swap ARMED at 0x8E1CD0: %d -> %d",
+                      global_config.rare_cheats.start_power_swap_sno,
+                      global_config.rare_cheats.start_power_swap_as_sno)
+            }
+            // d3hack-custom: read side. Which per-skill numbers does the damage math ask for?
+            if (global_config.rare_cheats.skill_attr_read_probe ||
+                (global_config.rare_cheats.script_event_impersonate_as_sno > 0 &&
+                 (ForcedPrimaryCount() > 0 ||
+                  global_config.rare_cheats.script_event_impersonate_sno > 0))) {
+                if (global_config.rare_cheats.damage_bonus_probe) {
+                    PRINT_LINE("[d3hack-skillread] NOT INSTALLED: DamageBonusProbe owns "
+                               "FastAttribGetValueFloat. Turn it off to use SkillAttrReadProbe.");
+                } else if (FastAttribGetValueFloat != nullptr) {
+                    SkillAttrReadProbe::InstallAtFuncPtr(FastAttribGetValueFloat);
+                    PRINT("[d3hack-skillread] per-skill attribute hook installed on "
+                          "FastAttribGetValueFloat: watching %d power(s), 0x5A8 damage mirror "
+                          "-> power %d",
+                          SkillAttrWatchCount(),
+                          global_config.rare_cheats.script_event_impersonate_as_sno)
+                } else {
+                    PRINT_LINE("[d3hack-skillread] NOT INSTALLED: FastAttribGetValueFloat "
+                               "unresolved");
+                }
+            }
+            // d3hack-custom: the 6pc damage gate. PowerBuffAppliedDamageGetPowerID's native.
+            if (global_config.rare_cheats.script_event_impersonate_as_sno > 0 &&
+                (ForcedPrimaryCount() > 0 ||
+                 global_config.rare_cheats.script_event_impersonate_sno > 0)) {
+                AppliedDamagePowerSno::InstallAtOffset(0x9D4040);
+                AppliedDamagePowerId::InstallAtOffset(0x9D40A0);
+                PRINT("[d3hack-primary] DAMAGE-POWER swap ARMED at 0x9D4040 (sno) + 0x9D40A0 "
+                      "(instance id), answered as %d",
+                      global_config.rare_cheats.script_event_impersonate_as_sno)
+            }
+            // d3hack-custom: THE FIX. 0x9B1C7C / 0x9B1C80 are shared with the read-only
+            // ScriptEventProbe, and two hooks on one address is the recurring bug in this file,
+            // so they are mutually exclusive and the conflict is REPORTED, not silently resolved.
+            if (global_config.rare_cheats.script_event_impersonate_sno > 0 &&
+                global_config.rare_cheats.script_event_impersonate_as_sno > 0) {
+                if (global_config.rare_cheats.script_event_probe) {
+                    PRINT_LINE("[d3hack-primary] NOT INSTALLED: ScriptEventProbe owns 0x9B1C7C. "
+                               "Turn ScriptEventProbe off to use the impersonation.");
+                } else {
+                    ScriptEventImpersonate::InstallAtOffset(0x9B1C7C);
+                    ScriptEventRestore::InstallAtOffset(0x9B1C80);
+                    PRINT("[d3hack-primary] SCRIPT-LEVEL impersonation ARMED: %d seen as %d by "
+                          "power scripts at 0x9B1C7C (restored at 0x9B1C80)",
+                          global_config.rare_cheats.script_event_impersonate_sno,
+                          global_config.rare_cheats.script_event_impersonate_as_sno)
+                }
+            }
+            // d3hack-custom: read-only. Where does the script see the attacking power?
+            if (global_config.rare_cheats.script_event_probe) {
+                ScriptEventProbe::InstallAtOffset(0x9B1C7C);
+                PRINT("[d3hack-script] script-event probe installed at 0x9B1C7C, watching %d "
+                      "power(s) (read-only)",
+                      SkillAttrWatchCount())
+            }
+            // d3hack-custom: Elemental Arrow counts as a primary for the set's own listener.
+            // 0x852424 / 0x852428 are shared with the retired skill-gate probe, and two hooks on
+            // one address is the recurring bug in this file -- so they are mutually exclusive and
+            // the conflict is REPORTED rather than silently resolved.
+            if (global_config.rare_cheats.primary_event_impersonate_sno > 0 &&
+                global_config.rare_cheats.primary_event_impersonate_as_sno > 0) {
+                if (global_config.rare_cheats.skill_gate_probe) {
+                    PRINT_LINE("[d3hack-primary] NOT INSTALLED: SkillGateProbe owns 0x852424. "
+                               "Turn SkillGateProbe off to use the impersonation.");
+                } else {
+                    PrimaryEventImpersonate::InstallAtOffset(0x852424);
+                    PrimaryEventRestore::InstallAtOffset(0x852428);
+                    PRINT("[d3hack-primary] power-used event impersonation ARMED: %d presented "
+                          "as %d at 0x852424 (restored at 0x852428)",
+                          global_config.rare_cheats.primary_event_impersonate_sno,
+                          global_config.rare_cheats.primary_event_impersonate_as_sno)
+                }
+            }
+            // d3hack-custom: the skill-gate probe. Own key, log only, nothing behavioural.
+            if (global_config.rare_cheats.skill_gate_probe) {
+                SkillGateArm::InstallAtOffset(0x852424);     // the `bl 0x9A4400`
+                SkillGateDisarm::InstallAtOffset(0x852428);  // its return address
+                TagHasKeyGate::InstallAtOffset(0x75DFF0);
+                TagGetIntGate::InstallAtOffset(0x75E6A0);
+                PRINT_LINE("[d3hack-gate] skill-gate probe ARMED: bracketing 0x852424 -> 0x9A4400, "
+                           "logging tag reads at 0x75DFF0 / 0x75E6A0 (HOT -- turn off when done)");
+            }
+            // d3hack-custom: Gears of Dreadlands + Kridershot. See the comment block above
+            // the PowerIsPrimaryOverride definition for how 0x731800 was identified.
+            // The feature key and the probe key each install this hook on their own; the probe
+            // only adds prints. ForcedPrimaryCount() also forces the list parse here, so the
+            // callback never parses on a game thread.
+            if (ForcedPrimaryCount() > 0 || global_config.rare_cheats.power_is_primary_probe) {
+                PowerIsPrimaryOverride::InstallAtOffset(kPowerIsPrimaryOffset);
+                PRINT("[d3hack-primary] PowerIsPrimary hooked at 0x%X -- %d power(s) forced "
+                      "primary, probe=%d",
+                      static_cast<unsigned>(kPowerIsPrimaryOffset), ForcedPrimaryCount(),
+                      global_config.rare_cheats.power_is_primary_probe ? 1 : 0)
+                for (int i = 0; i < ForcedPrimaryCount(); ++i)
+                    PRINT("[d3hack-primary]   forcing power sno %d",
+                          static_cast<int>(s_arForcedPrimary[i]))
+            }
             if (global_config.rare_cheats.momentum_autofire_every > 0 ||
                 global_config.rare_cheats.momentum_no_decay) {
                 MomentumAutoFire::InstallAtOffset(0x8560A4);   // after w3 is set, args live
@@ -13626,8 +14841,12 @@ namespace d3 {
             if ((global_config.rare_cheats.momentum_no_decay ||
                  global_config.rare_cheats.momentum_autofire_every > 0 ||
                  global_config.rare_cheats.momentum_duration_pct > 100 ||
-                 global_config.rare_cheats.rift_progress_probe) &&
+                 global_config.rare_cheats.rift_progress_probe ||
+                 global_config.rare_cheats.skill_attr_probe) &&
                 !global_config.rare_cheats.buff_stack_probe) {
+                if (global_config.rare_cheats.skill_attr_probe)
+                    PRINT("[d3hack-skillattr] per-skill attribute watch ARMED on %d power(s)",
+                          SkillAttrWatchCount())
                 // RiftProgressProbe checks 0x524 inside this same callback, so it must
                 // appear in the install gate. A flag that switches a feature on has to be
                 // in that feature's install condition -- five shipped features in this
